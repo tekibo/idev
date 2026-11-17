@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""`xcodebuild -list -json` for Linux.
+
+React Native's CLI calls this before it builds. It needs the project's
+targets, configurations and shared schemes; no compiler is involved.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lib import xcodeproj  # noqa: E402
+
+
+def configurations(project: xcodeproj.Project) -> list[str]:
+    names: list[str] = []
+    configuration_list = project.objects.get(project.root.get("buildConfigurationList", ""), {})
+    for config_id in configuration_list.get("buildConfigurations", []):
+        name = project.objects.get(config_id, {}).get("name", "")
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        for target in project.targets:
+            for name in target.configurations:
+                if name not in names:
+                    names.append(name)
+    return names
+
+
+def schemes(project: xcodeproj.Project) -> list[str]:
+    directory = os.path.dirname(project.path)
+    names: list[str] = []
+    patterns = [
+        os.path.join(directory, "xcshareddata", "xcschemes", "*.xcscheme"),
+        os.path.join(directory, "xcuserdata", "*", "xcschemes", "*.xcscheme"),
+    ]
+    for pattern in patterns:
+        for path in sorted(glob.glob(pattern)):
+            name = os.path.splitext(os.path.basename(path))[0]
+            if name not in names:
+                names.append(name)
+    if not names:
+        names = [target.name for target in project.targets if target.is_application]
+    return names
+
+
+def project_info(path: str) -> dict:
+    project = xcodeproj.Project(path)
+    return {
+        "path": os.path.abspath(path),
+        "targets": [target.name for target in project.targets],
+        "configurations": configurations(project),
+        "schemes": schemes(project),
+    }
+
+
+def discover_project() -> str:
+    projects = sorted(glob.glob(os.path.join(os.getcwd(), "*.xcodeproj")))
+    if len(projects) != 1:
+        raise SystemExit("xcodebuild: -list needs one -project or one .xcodeproj in the directory")
+    return projects[0]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-list", action="store_true")
+    parser.add_argument("-json", action="store_true")
+    parser.add_argument("-project")
+    parser.add_argument("-workspace")
+    args, _unknown = parser.parse_known_args()
+
+    if args.workspace:
+        workspace = xcodeproj.Workspace(args.workspace)
+        projects = [project_info(path) for path in workspace.project_paths if path.endswith(".xcodeproj")]
+        info = {
+            "path": os.path.abspath(args.workspace),
+            "targets": sorted({target for item in projects for target in item["targets"]}),
+            "configurations": sorted({name for item in projects for name in item["configurations"]}),
+            "schemes": sorted({name for item in projects for name in item["schemes"]}),
+        }
+        print(json.dumps({"workspace": info}, indent=2))
+        return 0
+
+    path = args.project or discover_project()
+    print(json.dumps({"project": project_info(path)}, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

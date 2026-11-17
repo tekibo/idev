@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# defaults shim for i-dev transparent macOS compatibility
+# Intercepts macOS user defaults and plist queries from @expo/cli
+
+if [ "$1" = "read" ]; then
+    shift
+    target="$1"
+    key="$2"
+    if [ "$key" = "CFBundleIdentifier" ] || echo "$target" | grep -qi "Simulator"; then
+        echo "com.apple.iphonesimulator"
+        exit 0
+    fi
+fi
+
+exit 0

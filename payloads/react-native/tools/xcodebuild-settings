@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""`xcodebuild -showBuildSettings -json` for Linux.
+
+React Native's CLI reads the built app's target settings before it installs
+and launches the product. The values come from the same project model the PIF
+generator uses; no compiler is involved.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lib import xcodeproj  # noqa: E402
+
+
+def projects_from(path: str, workspace: bool) -> list[xcodeproj.Project]:
+    if workspace:
+        found = xcodeproj.Workspace(path)
+        return [
+            xcodeproj.Project(item)
+            for item in found.project_paths
+            if item.endswith(".xcodeproj")
+        ]
+    return [xcodeproj.Project(path)]
+
+
+def product_name(target: xcodeproj.Target, configuration: str) -> str:
+    stack = target.settings(configuration)
+    return stack.raw("PRODUCT_NAME") or target.product_name or target.name
+
+
+def build_settings(
+    target: xcodeproj.Target,
+    configuration: str,
+    derived: str,
+) -> dict[str, str]:
+    stack = target.settings(configuration)
+    resolved = stack.resolve()
+    name = product_name(target, configuration)
+    app = f"{name}.app"
+    products = os.path.join(
+        derived, "Build", "Products", f"{configuration}-iphoneos"
+    )
+    resolved.update(
+        {
+            "TARGET_NAME": target.name,
+            "PRODUCT_NAME": name,
+            "CONFIGURATION": configuration,
+            "PLATFORM_NAME": "iphoneos",
+            "TARGET_BUILD_DIR": products,
+            "BUILT_PRODUCTS_DIR": products,
+            "CONFIGURATION_BUILD_DIR": products,
+            "WRAPPER_EXTENSION": "app",
+            "FULL_PRODUCT_NAME": app,
+            "EXECUTABLE_FOLDER_PATH": app,
+            "INFOPLIST_PATH": os.path.join(app, "Info.plist"),
+        }
+    )
+    return resolved
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-showBuildSettings", action="store_true")
+    parser.add_argument("-json", action="store_true")
+    parser.add_argument("-workspace")
+    parser.add_argument("-project")
+    parser.add_argument("-scheme")
+    parser.add_argument("-target")
+    parser.add_argument("-configuration", default="Release")
+    parser.add_argument("-sdk")
+    parser.add_argument("-derivedDataPath")
+    args, _unknown = parser.parse_known_args()
+
+    container = args.workspace or args.project
+    if not container:
+        raise SystemExit("xcodebuild: -showBuildSettings needs -workspace or -project")
+
+    derived = args.derivedDataPath
+    if not derived:
+        derived = os.path.join(
+            os.path.dirname(os.path.abspath(container)), "build", "DerivedData"
+        )
+
+    projects = projects_from(container, bool(args.workspace))
+    preferred = args.target or args.scheme or ""
+    targets = [
+        target
+        for project in projects
+        for target in project.targets
+        if target.is_application
+    ]
+    targets.sort(key=lambda target: (target.name != preferred, target.name))
+
+    settings = [
+        {
+            "target": target.name,
+            "buildSettings": build_settings(target, args.configuration, derived),
+        }
+        for target in targets
+    ]
+    print(json.dumps(settings, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

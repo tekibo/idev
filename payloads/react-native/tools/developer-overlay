@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Build a Developer directory Swift Build can use on Linux.
+
+The Darwin Swift SDK ships `Platforms/` and a toolchain tree, but the toolchain
+has no `Info.plist`, no `libclang.dylib` and no Darwin `libtool`. Rather than
+write into the installed SDK, this assembles an overlay that links to the real
+tree and adds what is missing.
+
+    developer-overlay <real Developer dir> <output dir>
+"""
+
+from __future__ import annotations
+
+import glob
+import os
+import shutil
+import sys
+import plistlib
+
+import swiftenv
+from developer_platforms import overlay_platforms
+from developer_swift import overlay_swift_frontend
+
+TOOLCHAIN = "Toolchains/XcodeDefault.xctoolchain"
+DEFAULT_TOOLCHAIN_ID = "com.apple.dt.toolchain.XcodeDefault"
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+LIBTOOL = """#!/bin/sh
+if [ "$1" = "--version" ] || [ "$1" = "-V" ] || [ "$1" = "-v" ]; then
+    echo "Apple Inc. version cctools-1000.4.5"
+    exit 0
+fi
+exec /usr/bin/llvm-libtool-darwin "$@"
+"""
+
+
+def link(source: str, target: str) -> None:
+    if os.path.lexists(target):
+        return
+    os.symlink(source, target)
+
+
+def mirror(source_dir: str, target_dir: str, extra: dict[str, str]) -> None:
+    os.makedirs(target_dir, exist_ok=True)
+    for entry in os.listdir(source_dir):
+        link(os.path.join(source_dir, entry), os.path.join(target_dir, entry))
+    for name, destination in extra.items():
+        path = os.path.join(target_dir, name)
+        if os.path.lexists(path):
+            continue
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(destination)
+        os.chmod(path, 0o755)
+
+
+def libclang() -> str | None:
+    candidates: list[str] = []
+    swift_bin = swiftenv.swift_bin()
+    if swift_bin:
+        swift_lib = os.path.normpath(os.path.join(swift_bin, "..", "lib"))
+        candidates.extend(sorted(glob.glob(os.path.join(swift_lib, "libclang.so*"))))
+        candidates.append(os.path.join(swift_lib, "libclang.dylib"))
+    candidates.extend(("/usr/lib/libclang.so", "/usr/lib/libclang.dylib"))
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def build(real: str, overlay: str) -> None:
+    real = os.path.abspath(real)
+    overlay = os.path.abspath(overlay)
+    shutil.rmtree(overlay, ignore_errors=True)
+    os.makedirs(os.path.join(overlay, TOOLCHAIN, "usr"), exist_ok=True)
+
+    overlay_platforms(real, overlay, HERE)
+
+    toolchain = os.path.join(real, TOOLCHAIN)
+    meta = {
+        "Identifier": DEFAULT_TOOLCHAIN_ID,
+        "Aliases": ["default"],
+        "DisplayName": "Xcode Default",
+        "Version": "27.0",
+    }
+    with open(os.path.join(overlay, TOOLCHAIN, "Info.plist"), "wb") as handle:
+        plistlib.dump(meta, handle)
+
+    real_usr = os.path.join(toolchain, "usr")
+    overlay_usr = os.path.join(overlay, TOOLCHAIN, "usr")
+    clang = libclang()
+    os.makedirs(os.path.join(overlay_usr, "bin"), exist_ok=True)
+    with open(os.path.join(overlay_usr, "bin", "libtool"), "w", encoding="utf-8") as handle:
+        handle.write(LIBTOOL)
+    os.chmod(os.path.join(overlay_usr, "bin", "libtool"), 0o755)
+
+    # The SDK bundle carries no compiler binaries; the Darwin-capable clang and
+    # Swift frontend live in the host Swift toolchain. Without these in the
+    # toolchain's own bin directory Swift Build falls back to the Linux clang
+    # and every compile fails.
+    toolchain_bin = swiftenv.swift_bin()
+    if not toolchain_bin or not os.path.isdir(toolchain_bin):
+        raise SystemExit("error: IDEV_SWIFT_BIN must name the private Swift bin directory")
+    for tool in os.listdir(toolchain_bin):
+        if tool == "swift-frontend":
+            overlay_swift_frontend(
+                toolchain_bin,
+                os.path.join(overlay_usr, "bin"),
+                os.path.join(HERE, "strip-swift-header"),
+            )
+            continue
+        if not tool.startswith(("clang", "swift", "ld64", "ld.lld", "lld", "llvm-")):
+            continue
+        link(os.path.join(toolchain_bin, tool), os.path.join(overlay_usr, "bin", tool))
+
+    for entry in os.listdir(real_usr):
+        source = os.path.join(real_usr, entry)
+        target = os.path.join(overlay_usr, entry)
+        if entry == "bin":
+            for tool in os.listdir(source):
+                link(os.path.join(source, tool), os.path.join(target, tool))
+        elif entry == "lib":
+            mirror(source, target, {})
+            if clang:
+                link(clang, os.path.join(target, "libclang.dylib"))
+        else:
+            link(source, target)
+
+    # The Darwin SDK ships a patched ld64.lld (a trampoline over the real
+    # linker plus llvm-lib). The host linker refuses iOS, so prefer the SDK's.
+    bundle = os.path.dirname(real)
+    sdk_toolset = os.path.join(bundle, "toolset", "bin")
+    if os.path.isdir(sdk_toolset):
+        overlay_bin = os.path.join(overlay_usr, "bin")
+        trampoline = os.path.join(sdk_toolset, "ld64.lld")
+        if os.path.isfile(trampoline):
+            # Xcode passes -fatal_warnings, which turns LLD's "does not
+            # support linking for platform iOS" warning into a hard error even
+            # though the link itself succeeds. Drop just that flag.
+            for name in ("ld64.lld", "ld.lld"):
+                target = os.path.join(overlay_bin, name)
+                if os.path.lexists(target):
+                    os.remove(target)
+                link(os.path.join(HERE, name), target)
+        for tool in ("llvm-lib", "dsymutil"):
+            candidate = os.path.join(sdk_toolset, tool)
+            if os.path.isfile(candidate):
+                link(candidate, os.path.join(overlay_bin, tool))
+
+    # Swift's C++ interop headers (swift/bridging) live in the host toolchain,
+    # not in the SDK bundle; without them any C++ target that uses interop
+    # fails to compile.
+    swift_include = swiftenv.swift_include()
+    if not swift_include or not os.path.isdir(swift_include):
+        raise SystemExit("error: private Swift include directory not found; set IDEV_SWIFT_BIN")
+    if not os.path.lexists(os.path.join(overlay_usr, "include")):
+        link(swift_include, os.path.join(overlay_usr, "include"))
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print("usage: developer-overlay <real Developer dir> <output dir>", file=sys.stderr)
+        return 2
+    build(sys.argv[1], sys.argv[2])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

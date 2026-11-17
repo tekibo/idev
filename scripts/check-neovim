@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+set -u
+
+failed=0
+fail() {
+    echo "neovim-check: $*" >&2
+    failed=1
+}
+
+command -v nvim >/dev/null || { echo "neovim-check: nvim not found" >&2; exit 1; }
+command -v gopls >/dev/null || { echo "neovim-check: gopls not found" >&2; exit 1; }
+
+ROOTS=(cmd internal payloads)
+FILES=$(find "${ROOTS[@]}" -name '*.go' -type f 2>/dev/null | sort)
+[ -n "$FILES" ] || exit 0
+
+# shellcheck disable=SC2086
+gopls check $FILES || fail "gopls check reported diagnostics"
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+cat >"$TMP/check.lua" <<'LUA'
+local files = vim.split(vim.env.NVIM_CHECK_FILES or "", "\n", { trimempty = true })
+local bufs = {}
+local failed = false
+for _, file in ipairs(files) do
+  vim.cmd.edit(vim.fn.fnameescape(file))
+  table.insert(bufs, { file = file, bufnr = vim.api.nvim_get_current_buf() })
+end
+for _, item in ipairs(bufs) do
+  local attached = vim.wait(10000, function()
+    return #vim.lsp.get_clients({ bufnr = item.bufnr }) > 0
+  end, 100)
+  if not attached then
+    print("NVIM_CHECK_FAIL " .. item.file .. " gopls did not attach")
+    failed = true
+  end
+end
+
+local function snapshot()
+  local out = {}
+  for _, item in ipairs(bufs) do
+    for _, d in ipairs(vim.diagnostic.get(item.bufnr)) do
+      table.insert(out, string.format("%s:%d:%d:%s:%s", item.file, d.lnum, d.col, tostring(d.severity), d.message))
+    end
+  end
+  table.sort(out)
+  return table.concat(out, "\n")
+end
+
+local last = nil
+local stable = 0
+local settled = vim.wait(20000, function()
+  local current = snapshot()
+  if current == last then
+    stable = stable + 1
+  else
+    stable = 0
+    last = current
+  end
+  return stable >= 3
+end, 250)
+if not settled then
+  print("NVIM_CHECK_FAIL diagnostics did not settle")
+  failed = true
+end
+
+for _, item in ipairs(bufs) do
+  for _, d in ipairs(vim.diagnostic.get(item.bufnr)) do
+    if d.severity == vim.diagnostic.severity.ERROR or d.severity == vim.diagnostic.severity.WARN then
+      print(string.format("NVIM_CHECK %s:%d:%d [%s] %s", item.file, d.lnum + 1, d.col + 1, d.severity == 1 and "E" or "W", d.message))
+      failed = true
+    end
+  end
+end
+if failed then vim.cmd("cquit 1") end
+vim.cmd("qa!")
+LUA
+
+NVIM_CONFIG="${NVIM_CONFIG:-$HOME/.config/nvim/init.lua}"
+if [ ! -f "$NVIM_CONFIG" ]; then
+    fail "Neovim config missing at $NVIM_CONFIG"
+else
+    NVIM_CHECK_FILES="$FILES" nvim --headless -u "$NVIM_CONFIG" -l "$TMP/check.lua" || fail "Neovim headless reported diagnostics"
+fi
+
+if [ "$failed" -ne 0 ]; then
+    echo "REFLECTION_LAW: A diagnostic tests code at hand. Walk 30 to 40 steps back to the north star before editing. The code may be unnecessary." >&2
+fi
+
+[ "$failed" -eq 0 ]

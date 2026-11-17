@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+set -u
+
+MODULE="github.com/tekibo/idev"
+ROOT="$MODULE/internal/"
+failed=0
+
+group() {
+    case "$1" in
+        "$MODULE/cmd/"*) echo cmd ;;
+        "$MODULE/internal/cli/help"|"$MODULE/internal/cli/help/"*) echo clihelp ;;
+        "$MODULE/internal/cli"|"$MODULE/internal/cli/"*) echo cli ;;
+        "$MODULE/internal/manager/core"|"$MODULE/internal/manager/core/"*) echo core ;;
+        "$MODULE/internal/manager/components"|"$MODULE/internal/manager/components/"*) echo ops ;;
+        "$MODULE/internal/manager/"*) echo feature ;;
+        "$MODULE/internal/manager"|"$MODULE/internal/manager/") echo manager ;;
+        "$MODULE/internal/platform/"*) echo platform ;;
+        "$MODULE/internal/security/"*) echo security ;;
+        "$MODULE/internal/tools/"*) echo tools ;;
+        *) echo other ;;
+    esac
+}
+
+allowed() {
+    case "$1/$2" in
+        cmd/cli) return 0 ;;
+        cli/manager) return 0 ;;
+        cli/clihelp) return 0 ;;
+        manager/core|manager/ops|manager/feature) return 0 ;;
+        feature/core|feature/ops|feature/feature) return 0 ;;
+        ops/core) return 0 ;;
+        manager/platform|manager/security|manager/tools) return 0 ;;
+        feature/platform|feature/security|feature/tools) return 0 ;;
+        core/platform|core/security|core/tools) return 0 ;;
+        ops/platform|ops/security|ops/tools) return 0 ;;
+        core/core|ops/ops) return 0 ;;
+        platform/platform) return 0 ;;
+        security/platform|security/security) return 0 ;;
+        tools/platform|tools/tools) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+packages=(./internal/... ./cmd/...)
+listing=$(mktemp)
+trap 'rm -f "$listing"' EXIT
+if ! go list -f '{{.ImportPath}}|{{join .Imports " "}}' "${packages[@]}" >"$listing"; then
+    echo "imports: go list failed" >&2
+    exit 1
+fi
+
+while IFS='|' read -r pkg imports; do
+    pkg_group=$(group "$pkg")
+    for imp in $imports; do
+        case "$imp" in
+            "$ROOT"*) ;;
+            *) continue ;;
+        esac
+        imp_group=$(group "$imp")
+        if ! allowed "$pkg_group" "$imp_group"; then
+            echo "import boundary: $pkg ($pkg_group) imports $imp ($imp_group)" >&2
+            failed=1
+        fi
+    done
+done <"$listing"
+
+[ "$failed" -eq 0 ]

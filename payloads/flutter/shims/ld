@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+SDKB="${DARWIN_SDK_BUNDLE:-}"
+[ -n "$SDKB" ] || { echo "$(basename "$0"): DARWIN_SDK_BUNDLE not set; run idev doctor" >&2; exit 2; }
+exec "$SDKB/toolset/bin/ld64.lld" "$@"

@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""`actool` with the asset-tag query that Swift Build asks for.
+
+The Apple tooling actool compiles asset catalogs but does not implement
+`--print-asset-tag-combinations`, which Xcode's asset catalog task uses to
+discover on-demand resource tags. Without it the build stops with
+"failed to read asset tags".
+
+An app with no on-demand asset packs has no combinations, so the empty result
+below is the correct answer for that case. Everything else is delegated to the
+real actool unchanged.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+import swiftenv
+
+EMPTY_COMBINATIONS = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>com.apple.actool.asset-tag-combinations</key>
+\t<array/>
+</dict>
+</plist>
+"""
+
+ROOT = swiftenv.apple_tools_root()
+BUNDLE = swiftenv.sdk_bundle()
+CANDIDATES = (
+    os.environ.get("I_DEV_ACTOOL", ""),
+    os.path.join(ROOT, "tools", "darwin-tools", ".build", "release", "actool") if ROOT else "",
+    os.path.join(BUNDLE, "Developer", "Platforms", "iPhoneOS.platform", "Developer", "usr", "bin", "actool") if BUNDLE else "",
+)
+
+
+def real_actool() -> str:
+    for candidate in CANDIDATES:
+        if candidate and os.path.isfile(candidate) and candidate != os.path.abspath(__file__):
+            return candidate
+    raise SystemExit("error: private actool not found; set IDEV_APPLE_TOOLS or I_DEV_ACTOOL")
+
+
+def main() -> int:
+    if "--print-asset-tag-combinations" in sys.argv[1:]:
+        sys.stdout.write(EMPTY_COMBINATIONS)
+        return 0
+    tool = real_actool()
+    os.execv(tool, [tool] + sys.argv[1:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

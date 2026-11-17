@@ -1,0 +1,2 @@
+# Vendored upstream sources keep their original whitespace.
+components/** whitespace=-trailing-space,-blank-at-eof

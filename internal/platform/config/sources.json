@@ -1,0 +1,16 @@
+{
+  "release": {
+    "manifest": "https://github.com/tekibo/idev/releases/latest/download/manifest.json"
+  },
+  "swift": {
+    "version": "6.4.2",
+    "amd64": {
+      "url": "https://download.swift.org/swift-6.4.2-release/ubi10/swift-6.4.2-RELEASE/swift-6.4.2-RELEASE-ubi10.tar.gz",
+      "sha256": "d2663c735fd2a5a6d2a004a5701f77df14ff93b9e5ea54815e8616832058bfbf"
+    },
+    "arm64": {
+      "url": "https://download.swift.org/swift-6.4.2-release/ubi10-aarch64/swift-6.4.2-RELEASE/swift-6.4.2-RELEASE-ubi10-aarch64.tar.gz",
+      "sha256": "236a49a0e848a6359937044ec125896f76a4f5284c99a954468e3bb93429c258"
+    }
+  }
+}

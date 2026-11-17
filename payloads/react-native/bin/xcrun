@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Stand-in for Apple xcrun: maps SDK queries and clang invocations onto the
+# xtool/Apple tooling Darwin toolchain on Linux.
+#
+# `xcrun devicectl` is delegated to expo/tools/devicectl, which answers the
+# device listing/install/launch commands Expo uses by calling xtool. xtool is
+# the only signer in this pipeline; build products stay unsigned.
+set -euo pipefail
+here=$(dirname "$(readlink -f "$0")")
+ROOT="${IDEV_HOME:-$(cd "$here/../.." && pwd)}"
+SDKB="${DARWIN_SDK_BUNDLE:-}"
+if [ -z "$SDKB" ]; then
+    echo "xcrun: DARWIN_SDK_BUNDLE not set; run idev doctor" >&2
+    exit 2
+fi
+[ -d "$SDKB" ] || { echo "xcrun: SDK bundle not found at $SDKB" >&2; exit 2; }
+[ -z "${XCRUN_SHIM_LOG:-}" ] || echo "xcrun $*" >>"$XCRUN_SHIM_LOG"
+
+sdk_path() {
+  case "$1" in
+    iphonesimulator*) echo "$SDKB/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator.sdk" ;;
+    macosx*) echo "$SDKB/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk" ;;
+    *) echo "$SDKB/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk" ;;
+  esac
+}
+
+sdk=iphoneos
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --sdk | -sdk) sdk=$2; shift 2 ;;
+    --version)
+      if [ ${#args[@]} -eq 0 ]; then echo "xcrun version 71."; exit 0; fi
+      args+=("$1"); shift
+      ;;
+    --show-sdk-path) sdk_path "$sdk"; exit 0 ;;
+    --show-sdk-version | --show-sdk-platform-version)
+      python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[\"Version\"])" "$(sdk_path "$sdk")/SDKSettings.json"
+      exit 0
+      ;;
+    --find | -f | -find)
+      shift
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --sdk | -sdk) sdk=$2; shift 2 ;;
+          -*) shift ;;
+          *) break ;;
+        esac
+      done
+      [ $# -gt 0 ] || exit 1
+      tool="$1"
+      case "$tool" in
+        clang | cc) echo "$here/clang-darwin"; exit 0 ;;
+        clang++) echo "$here/clang++-darwin"; exit 0 ;;
+      esac
+      for c in "$here/$tool" "llvm-$tool" "$tool"; do
+        if p=$(command -v "$c"); then echo "$p"; exit 0; fi
+      done
+      exit 1
+      ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+[ ${#args[@]} -gt 0 ] || exit 0
+
+tool=${args[0]}
+rest=("${args[@]:1}")
+case "$tool" in
+  simctl)
+    if [[ "${rest[*]}" == *"list"* ]]; then echo "{\"devices\": {}}"; fi
+    exit 0
+    ;;
+  devicectl)
+    IDEV_HOME="$ROOT" exec python3 "$here/../tools/devicectl" "${rest[@]}"
+    ;;
+  xcdevice)
+    IDEV_HOME="$ROOT" exec python3 "$here/../tools/xcdevice-list" "${rest[@]}"
+    ;;
+  clang | clang++ | cc)
+    sdk_dir=$(sdk_path "$sdk")
+    case "$sdk" in
+      macosx*) triple="x86_64-apple-macosx14.0" ;;
+      iphonesimulator*) triple="x86_64-apple-ios15.1-simulator" ;;
+      *) triple="arm64-apple-ios15.1" ;;
+    esac
+    if [ -z "${IDEV_SWIFT_BIN:-}" ]; then
+        echo "xcrun: IDEV_SWIFT_BIN is not set" >&2
+        exit 2
+    fi
+    clang_bin="$IDEV_SWIFT_BIN/clang"
+    [ "$tool" = "clang++" ] && clang_bin="$IDEV_SWIFT_BIN/clang++"
+    ld64="$here/../tools/ld64.lld"
+    if [ ! -x "$ld64" ]; then
+        echo "xcrun: private SDK linker not found at $ld64" >&2
+        exit 2
+    fi
+    newargs=("${rest[@]}")
+    joined=" ${newargs[*]} "
+    [[ "$joined" == *" -target "* ]] || newargs=(-target "$triple" "${newargs[@]}")
+    [[ "$joined" == *" -isysroot "* ]] || newargs=(-isysroot "$sdk_dir" "${newargs[@]}")
+    filtered=()
+    for arg in "${newargs[@]}"; do
+      case "$arg" in
+        -fuse-ld*|--ld-path=*) ;;
+        *) filtered+=("$arg") ;;
+      esac
+    done
+    exec "$clang_bin" -fuse-ld="$ld64" -mlinker-version=1200 "${filtered[@]}"
+    ;;
+  codesign) exit 0 ;;
+  *)
+    if [ -x "$here/$tool" ]; then exec "$here/$tool" "${rest[@]}"; fi
+    if command -v "llvm-${tool//_/-}" >/dev/null; then exec "llvm-${tool//_/-}" "${rest[@]}"; fi
+    exec "$tool" "${rest[@]}"
+    ;;
+esac

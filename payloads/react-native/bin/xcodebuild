@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# xcodebuild for Linux.
+#
+# Xcode's closed front end does exactly two things that Swift Build needs:
+#   * answer -version
+#   * produce PIF for -dumpPIF
+# Everything else (compiling, linking, resources, script phases, dependency
+# ordering) belongs to Swift Build, which is installed as `swbuild`.
+#
+# So this shim only translates arguments; it never compiles anything itself.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+DUMP_PIF="$HERE/../tools/dump-pif"
+ENGINE="${ENGINE:-$HERE/build}"
+
+usage_error() {
+    echo "xcodebuild: error: $*" >&2
+    exit 1
+}
+
+if [ $# -eq 0 ]; then
+    echo "xcodebuild: error: no action given" >&2
+    exit 1
+fi
+
+case "$1" in
+    -version)
+        echo "Xcode 27.0"
+        echo "Build version 27A266a"
+        exit 0
+        ;;
+    -showsdks)
+        echo "iOS 27.0 -sdk iphoneos27.0"
+        exit 0
+        ;;
+esac
+
+# `expo run:ios` asks for the destination list before building. A physical
+# device appears here; with none attached the placeholder is all Xcode would
+# report as well.
+case " $* " in
+    *" -showdestinations "*)
+        echo "{ platform:iOS, id:dvtdevice-DVTiPhonePlaceholder-iphoneos:placeholder, name:Any iOS Device }"
+        exit 0
+        ;;
+esac
+
+# React Native's CLI calls `xcodebuild -list -json` before it builds, then
+# `xcodebuild -showBuildSettings -json` before it installs the product.
+if [ "$1" = "-list" ]; then
+    exec python3 "$HERE/../tools/xcodebuild-list" "$@"
+fi
+case " $* " in
+    *" -showBuildSettings "*)
+        exec python3 "$HERE/../tools/xcodebuild-settings" "$@"
+        ;;
+esac
+
+# -dumpPIF <out> -project|-workspace <path>
+if [ "$1" = "-dumpPIF" ]; then
+    [ $# -ge 4 ] || usage_error "-dumpPIF needs an output path and -project/-workspace"
+    out="$2"
+    shift 2
+    exec python3 "$DUMP_PIF" "$out" "$@"
+fi
+
+container=""
+container_kind=""
+target=""
+configuration="Release"
+derived=""
+action="build"
+scheme=""
+
+positional=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -workspace)   container="$2"; container_kind="-workspace"; shift 2 ;;
+        -project)     container="$2"; container_kind="-project"; shift 2 ;;
+        -scheme)      scheme="$2"; shift 2 ;;
+        -target)      target="$2"; shift 2 ;;
+        -configuration) configuration="$2"; shift 2 ;;
+        -derivedDataPath) derived="$2"; shift 2 ;;
+        -destination|-sdk|-arch|-xcconfig|-resultBundlePath|-destination-timeout)
+            shift 2 ;;
+        build|clean|archive|test)
+            action="$1"; shift ;;
+        -*)
+            # Settings overrides (KEY=VALUE) and flags this shim does not model.
+            if [[ "$1" == *=* && "$1" != -* ]]; then
+                positional+=("$1")
+            fi
+            shift ;;
+        *)
+            positional+=("$1"); shift ;;
+    esac
+done
+
+[ -n "$container" ] || usage_error "no -workspace or -project given"
+
+if [ -z "$derived" ]; then
+    derived="$(cd "$(dirname "$container")" && pwd)/build/DerivedData"
+fi
+mkdir -p "$derived"
+
+if [ "$action" = "clean" ]; then
+    rm -rf "$derived" "$(dirname "$container")/build/XCBuildData"
+    echo "** CLEAN SUCCEEDED **"
+    exit 0
+fi
+
+# Expo skips `pod install` entirely when the host is not macOS, so it has to
+# happen before the PIF is generated: the PIF resolves each target's base
+# xcconfig, and a first build has no Pods xcconfig until this runs. Generating
+# first leaves PODS_ROOT/PODS_PODFILE_DIR_PATH empty, which breaks CocoaPods'
+# manifest check and the generated modules provider.
+#
+# It also has to run when the Podfile or its properties change, not only on a
+# first build, or a newly added package is silently left out.
+ios_dir="$(cd "$(dirname "$container")" && pwd)"
+if [ -f "$ios_dir/Podfile" ]; then
+    needs_pod_install=0
+    [ -d "$ios_dir/Pods" ] || needs_pod_install=1
+    [ -d "$ios_dir/build/generated" ] || needs_pod_install=1
+    [ -f "$ios_dir/Podfile.lock" ] || needs_pod_install=1
+    [ -f "$ios_dir/Pods/Manifest.lock" ] || needs_pod_install=1
+    if [ -f "$ios_dir/Podfile.lock" ]; then
+        [ "$ios_dir/Podfile" -nt "$ios_dir/Podfile.lock" ] && needs_pod_install=1
+        if [ -f "$ios_dir/Podfile.properties.json" ] &&
+           [ "$ios_dir/Podfile.properties.json" -nt "$ios_dir/Podfile.lock" ]; then
+            needs_pod_install=1
+        fi
+    fi
+    if [ -f "$ios_dir/Podfile.lock" ] && [ -f "$ios_dir/Pods/Manifest.lock" ]; then
+        cmp -s "$ios_dir/Podfile.lock" "$ios_dir/Pods/Manifest.lock" || needs_pod_install=1
+    fi
+    if [ "$needs_pod_install" -eq 1 ]; then
+        echo "note: installing CocoaPods dependencies"
+        ( cd "$ios_dir" && pod install ) || exit 1
+    fi
+fi
+
+pif="$derived/project.pif"
+python3 "$DUMP_PIF" "$pif" "$container_kind" "$container" --configuration "$configuration" >/dev/null
+
+# Swift Build needs the run destination; Xcode normally supplies it. The Apple
+# platform and toolchain live in the installed Darwin SDK bundle.
+# The SDK actool does not implement --print-asset-tag-combinations; the Python
+# shim beside this script does, and delegates every real compile to the SDK tool.
+actool_path="$HERE/../tools/actool"
+params="$derived/build-parameters.json"
+cat > "$params" <<EOF
+{
+  "action": "build",
+  "configurationName": "$configuration",
+  "activeRunDestination": {
+    "platform": "iphoneos",
+    "sdk": "iphoneos",
+    "sdkVariant": "iphoneos",
+    "targetArchitecture": "arm64",
+    "supportedArchitectures": ["arm64"],
+    "disableOnlyActiveArch": true
+  },
+  "arenaInfo": {
+    "derivedDataPath": "$derived",
+    "buildProductsPath": "$derived/Build/Products",
+    "buildIntermediatesPath": "$derived/Build/Intermediates.noindex",
+    "pchPath": "$derived/Build/Intermediates.noindex/PrecompiledHeaders",
+    "indexPCHPath": "$derived/Build/Intermediates.noindex/IndexPrecompiledHeaders",
+    "indexEnableDataStore": false
+  },
+  "overrides": { "ACToolPath": "$actool_path", "ASSETCATALOG_EXEC": "$actool_path" },
+  "commandLineOverrides": { "ACToolPath": "$actool_path", "ASSETCATALOG_EXEC": "$actool_path" }
+}
+EOF
+
+if [ -z "${DEVELOPER_DIR:-}" ]; then
+    [ -n "${DARWIN_SDK_BUNDLE:-}" ] || usage_error "Darwin SDK bundle not set; run idev doctor"
+    export DEVELOPER_DIR="$DARWIN_SDK_BUNDLE/Developer"
+fi
+
+selected="${target:-$scheme}"
+if [ -z "$selected" ]; then
+    selection=(--all-targets)
+else
+    selection=(--target "$selected")
+fi
+
+echo "note: Swift Build ($pif)"
+"$ENGINE" --pif "$pif" --developer-dir "$DEVELOPER_DIR" "${selection[@]}" |
+    python3 "$HERE/../tools/build-progress"
+status=${PIPESTATUS[0]}
+
+# The Expo CLI locates the product from these two lines in xcodebuild's output.
+if [ "$status" -eq 0 ]; then
+    app="$(find "$derived/Build/Products/$configuration-iphoneos" -maxdepth 1 -name '*.app' 2>/dev/null | head -1)"
+    if [ -n "$app" ]; then
+        echo "export CONFIGURATION_BUILD_DIR=$(dirname "$app")"
+        echo "export UNLOCALIZED_RESOURCES_FOLDER_PATH=$(basename "$app")"
+        echo "export PLATFORM_NAME=iphoneos"
+    fi
+fi
+exit "$status"

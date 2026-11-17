@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""Build a prebuilt pod product from an SPM package with Swift Build.
+
+`expo-modules-jsi` ships `apple/Package.swift` plus a script that drives
+`xcodebuild` to turn it into a framework. That script cannot run on Linux, so
+the package is built directly with `swift build --swift-sdk darwin` and the
+result is assembled into the framework layout the pod expects.
+
+Two toolchain gaps are compensated for, both in a scratch copy so the
+installed package is never modified:
+
+- The package enables `-enable-library-evolution`. Swift 6.4 cannot combine
+  library evolution with C++ interop types (it rejects `extension
+  expo.CppError: Error` with "C++ types ... do not support library evolution"),
+  and evolution exists for distributing binary SDKs, which is not what this
+  build is. The flag is removed from the copy.
+- SwiftPM links a dynamic product from archives carrying the module's object
+  files, and archives are only searched for undefined symbols, so the link
+  produces an empty dylib. `-Xlinker -all_load` makes it link every member.
+
+    build-prebuild-framework --package <dir> --product <Name> \\
+        --pods-root <Pods> --output <Name.framework> [--scratch <dir>]
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+
+import swiftenv
+
+SKIP_DIRECTORIES = {".build", ".swiftpm", ".git"}
+
+
+def log(message: str) -> None:
+    print(f"build-prebuild-framework: {message}", file=sys.stderr)
+
+
+def copy_package(source: str, destination: str) -> None:
+    """Mirror the package into a scratch directory, keeping build caches."""
+    os.makedirs(destination, exist_ok=True)
+    for entry in os.listdir(source):
+        if entry in SKIP_DIRECTORIES:
+            continue
+        source_path = os.path.join(source, entry)
+        target_path = os.path.join(destination, entry)
+        if os.path.isdir(source_path):
+            shutil.copytree(source_path, target_path, symlinks=True, dirs_exist_ok=True)
+        else:
+            shutil.copy2(source_path, target_path)
+
+
+def strip_library_evolution(scratch: str) -> None:
+    """Remove `-enable-library-evolution` from the scratch Package.swift.
+
+    `swiftc` has no `-disable-library-evolution`, so the flag has to leave the
+    manifest. Only the copy is touched.
+    """
+    manifest = os.path.join(scratch, "Package.swift")
+    try:
+        with open(manifest, encoding="utf-8") as handle:
+            contents = handle.read()
+    except OSError as error:
+        raise SystemExit(f"error: cannot read {manifest}: {error}")
+    stripped = re.sub(r'\s*"-enable-library-evolution",', "", contents)
+    if stripped != contents:
+        with open(manifest, "w", encoding="utf-8") as handle:
+            handle.write(stripped)
+        log("removed -enable-library-evolution for the scratch build")
+
+
+def generate_module_map(scratch: str, pods_root: str) -> None:
+    """Run the package's module-map generator for the `jsi` Clang module."""
+    script = os.path.join(scratch, "scripts", "generate-modulemap.sh")
+    if not os.path.isfile(script):
+        return
+    environment = dict(os.environ)
+    environment["PODS_ROOT"] = pods_root
+    result = subprocess.run(
+        ["bash", script], cwd=scratch, env=environment,
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        log((result.stderr or result.stdout).strip()[:400])
+
+
+def build(scratch: str, product: str, pods_root: str, triple: str,
+          developer_dir: str = "") -> subprocess.CompletedProcess:
+    environment = dict(os.environ)
+    environment["PODS_ROOT"] = pods_root
+    developer = developer_dir or environment.get("DEVELOPER_DIR", "")
+    bundle = swiftenv.sdk_bundle()
+    if not bundle or not os.path.isfile(os.path.join(bundle, "info.json")):
+        raise SystemExit("error: DARWIN_SDK_BUNDLE is not set; run idev doctor")
+    if not developer:
+        developer = os.path.join(bundle, "Developer")
+    environment["DEVELOPER_DIR"] = developer
+    # SwiftPM resolves `--swift-sdk darwin` through the manager's XDG root.
+    # Name the bundle directory explicitly so the lookup cannot drift.
+    swift_sdks_path = os.path.dirname(bundle)
+    include = swiftenv.swift_include()
+    if not include:
+        raise SystemExit("error: IDEV_SWIFT_BIN must name the private Swift bin directory")
+    command = [
+        "swift", "build",
+        # The native backend links the product from the module's object files;
+        # Swift Build drops them for this package and emits an empty dylib.
+        "--build-system", "native",
+        "-c", "release",
+        "--swift-sdk", "darwin",
+        "--triple", triple,
+        "--product", product,
+        # Swift Build omits the toolchain's C++ interop include for Swift SDK
+        # builds; packages using C++ interop need `swift/bridging`.
+        "-Xcc", f"-I{include}",
+        "-Xcxx", f"-I{include}",
+        # Library evolution rejects C++ interop types by default. The compiler
+        # ships an experimental feature that assumes resilient C++ types and
+        # lifts that diagnostic; without it the package cannot be built with
+        # the ABI Expo's prebuilt frameworks expect.
+        "-Xswiftc", "-enable-experimental-feature",
+        "-Xswiftc", "AssumeResilientCxxTypes",
+        # The module's object files live in an archive. Without -all_load the
+        # link step pulls nothing out of it and emits an empty dylib.
+        "-Xlinker", "-all_load",
+    ]
+    if swift_sdks_path:
+        command += ["--swift-sdks-path", swift_sdks_path]
+    return subprocess.run(command, cwd=scratch, env=environment)
+
+
+def find_release_dir(scratch: str, triple: str, product: str) -> str:
+    """Locate the directory holding the built product.
+
+    Swift Build (used by SwiftPM for Swift SDK builds) writes to
+    `.build/out/Products/<Configuration>-<platform>`; the native build system
+    uses `.build/<triple>/release`.
+    """
+    candidates = [
+        os.path.join(scratch, ".build", "out", "Products", "Release-iphoneos"),
+        os.path.join(scratch, ".build", triple, "release"),
+        os.path.join(scratch, ".build", "release"),
+    ]
+    for candidate in candidates:
+        if not os.path.isdir(candidate):
+            continue
+        for name in (f"lib{product}.dylib", f"lib{product}.so", f"lib{product}.a"):
+            if os.path.isfile(os.path.join(candidate, name)):
+                return candidate
+    raise SystemExit(f"error: no product for {product} in {scratch}")
+
+
+def set_install_name(binary: str, product: str) -> None:
+    """Give the dylib the name a framework binary is loaded by."""
+    tool = shutil.which("llvm-install-name-tool")
+    if not tool:
+        log("llvm-install-name-tool not found; leaving the install name as built")
+        return
+    name = f"@rpath/{product}.framework/{product}"
+    subprocess.run([tool, "-id", name, binary], check=False)
+
+
+def copy_modules(release: str, framework: str, product: str) -> None:
+    modules = os.path.join(framework, "Modules", f"{product}.swiftmodule")
+    os.makedirs(modules, exist_ok=True)
+    # SwiftPM emits a library's module either beside the binary or in a
+    # `Modules` subdirectory, depending on the build system.
+    search = (release, os.path.join(release, "Modules"))
+    for base in search:
+        source = os.path.join(base, f"{product}.swiftmodule")
+        if os.path.isdir(source):
+            for name in os.listdir(source):
+                shutil.copy2(os.path.join(source, name), os.path.join(modules, name))
+            break
+    # Consumers look the module up by architecture name.
+    for suffix, destination in (
+        (".swiftmodule", "arm64.swiftmodule"),
+        (".swiftdoc", "arm64.swiftdoc"),
+        (".swiftinterface", "arm64.swiftinterface"),
+        (".abi.json", "arm64.abi.json"),
+    ):
+        candidate = os.path.join(release, f"{product}{suffix}")
+        if not os.path.isfile(candidate):
+            candidate = os.path.join(release, "Modules", f"{product}{suffix}")
+        if os.path.isfile(candidate) and not os.path.exists(os.path.join(modules, destination)):
+            shutil.copy2(candidate, os.path.join(modules, destination))
+
+
+def write_consumer_modules(package: str, product: str, framework: str,
+                           pods_root: str) -> None:
+    """Publish an SPM product's Clang modules where consumers look for them.
+
+    A SwiftPM-built pod records its C++ target and the C++ modules its headers
+    include (for example `jsi`) as dependencies. Consumers resolve modules by
+    name through the header search paths, so the definitions have to live in a
+    `module.modulemap` inside one of those directories.
+
+    The body is derived entirely from the package: the C++ target's public
+    headers and the package's own generated module map.
+    """
+    headers = os.path.join(framework, "Headers")
+    include = os.path.join(package, "Sources", f"{product}-Cxx", "include")
+    if not os.path.isdir(include):
+        return
+    os.makedirs(headers, exist_ok=True)
+    shutil.copytree(include, headers, symlinks=True, dirs_exist_ok=True)
+
+    blocks = [
+        f"module {product}-Cxx {{".replace("-", "_"),
+        "  requires cplusplus",
+        f'  umbrella "{headers}"',
+        "  export *",
+        "}",
+    ]
+
+    generated = os.path.join(package, ".generated", "module.modulemap")
+    if os.path.isfile(generated):
+        with open(generated, encoding="utf-8") as handle:
+            text = handle.read()
+        # C++ modules must declare the language requirement; the generated map
+        # omits it because it is passed to builds that force the language.
+        text = re.sub(r"(?m)^(module [A-Za-z0-9_.]+ \{)$",
+                      r"\1\n  requires cplusplus", text)
+        blocks.append(text.strip())
+
+    public = os.path.join(pods_root, "Headers", "Public")
+    if not os.path.isdir(public):
+        return
+    destination = os.path.join(public, "module.modulemap")
+    begin = f"// >>> {product} (generated by expo tooling)"
+    end = f"// <<< {product}"
+    existing = ""
+    if os.path.isfile(destination):
+        with open(destination, encoding="utf-8") as handle:
+            existing = handle.read()
+        existing = re.sub(
+            rf"(?ms)^{re.escape(begin)}.*?^{re.escape(end)}\n?",
+            "", existing,
+        )
+    block = f"{begin}\n" + "\n".join(blocks) + f"\n{end}\n"
+    with open(destination, "w", encoding="utf-8") as handle:
+        handle.write(existing + block)
+
+
+def assemble(release: str, product: str, output: str,
+             package: str = "", pods_root: str = "") -> None:
+    framework = os.path.abspath(output)
+    shutil.rmtree(framework, ignore_errors=True)
+    os.makedirs(framework, exist_ok=True)
+
+    binary = None
+    for name in (f"lib{product}.dylib", f"lib{product}.so", f"lib{product}.a"):
+        candidate = os.path.join(release, name)
+        if os.path.isfile(candidate):
+            binary = candidate
+            break
+    if binary is None:
+        raise SystemExit(f"error: no binary for {product} in {release}")
+
+    target = os.path.join(framework, product)
+    shutil.copy2(binary, target)
+    if not binary.endswith(".a"):
+        os.chmod(target, 0o755)
+        set_install_name(target, product)
+
+    copy_modules(release, framework, product)
+
+    if package and pods_root:
+        write_consumer_modules(package, product, framework, pods_root)
+
+    headers = os.path.join(release, "include")
+    if os.path.isdir(headers):
+        shutil.copytree(headers, os.path.join(framework, "Headers"),
+                        symlinks=True, dirs_exist_ok=True)
+
+    info = {
+        "CFBundleExecutable": product,
+        "CFBundleIdentifier": f"org.swift.{product}",
+        "CFBundleName": product,
+        "CFBundlePackageType": "FMWK",
+        "CFBundleShortVersionString": "1.0",
+        "CFBundleVersion": "1",
+        "MinimumOSVersion": "16.4",
+    }
+    with open(os.path.join(framework, "Info.plist"), "wb") as handle:
+        plistlib.dump(info, handle)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--package", required=True)
+    parser.add_argument("--product", required=True)
+    parser.add_argument("--pods-root", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--scratch", default="")
+    parser.add_argument("--triple", default="arm64-apple-ios")
+    parser.add_argument("--developer-dir", default="")
+    parser.add_argument("--publish-only", action="store_true")
+
+    args = parser.parse_args()
+
+    if args.publish_only:
+        write_consumer_modules(args.package, args.product, args.output, args.pods_root)
+        return 0
+
+    scratch = args.scratch or os.path.join(
+        os.path.dirname(os.path.abspath(args.output)), ".prebuild", args.product
+    )
+    copy_package(args.package, scratch)
+    generate_module_map(scratch, args.pods_root)
+
+    result = build(scratch, args.product, args.pods_root, args.triple,
+                   args.developer_dir)
+    if result.returncode != 0:
+        print(f"error: swift build failed for {args.product}", file=sys.stderr)
+        return result.returncode
+    release = find_release_dir(scratch, args.triple, args.product)
+    assemble(release, args.product, args.output, args.package, args.pods_root)
+    print(f"built {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

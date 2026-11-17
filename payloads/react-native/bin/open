@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# `open` for Linux: React Native's dev server opens documentation links
+# through the macOS command. Delegate to the desktop opener.
+set -euo pipefail
+
+if [ "${1:-}" = "-a" ]; then
+    shift 2
+fi
+
+if ! command -v xdg-open >/dev/null 2>&1; then
+    echo "open: xdg-open not found" >&2
+    exit 127
+fi
+
+exec xdg-open "$@"

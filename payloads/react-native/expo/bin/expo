@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# `expo` with the macOS platform gate satisfied.
+#
+# `expo run:ios` exits early unless `process.platform === "darwin"`
+# (runIosAsync.js:304). The CLI itself is portable; only that check and the
+# tools it calls are macOS-specific, and the tools are shimmed. Loading the
+# platform shim here is per invocation, so nothing else on the system is
+# affected.
+set -uo pipefail
+
+project="${EXPO_PROJECT_DIR:-$PWD}"
+cli="$project/node_modules/.bin/expo"
+if [ ! -x "$cli" ]; then
+    echo "expo: no Expo CLI at $cli (run from the app directory)" >&2
+    exit 2
+fi
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+case "${1:-}" in
+    start|run:ios|run:android)
+        python3 "$HERE/metro-preflight" --project "$project" "$@" || true
+        ;;
+esac
+
+export NODE_OPTIONS="--require $HERE/../../tools/node-darwin.js ${NODE_OPTIONS:-}"
+
+progress_pid=""
+cleanup() {
+    if [ -n "$progress_pid" ]; then
+        kill "$progress_pid" 2>/dev/null || true
+        wait "$progress_pid" 2>/dev/null || true
+        progress_pid=""
+    fi
+}
+trap cleanup EXIT INT TERM
+
+if [ "${1:-}" = "run:ios" ]; then
+    progress="$project/.expo/idev-build-progress.log"
+    mkdir -p "$project/.expo"
+    : > "$progress"
+    export IDEV_BUILD_PROGRESS="$progress"
+    tail -n +1 -f "$progress" &
+    progress_pid=$!
+fi
+
+"$cli" "$@"
+status=$?
+cleanup
+trap - EXIT INT TERM
+exit "$status"

@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Read-only upstream delta for the apple-dev port. Never writes the tree.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+LOCK="$ROOT/internal/platform/config/sources.lock"
+CACHE="${IDEV_SYNC_CACHE:-/var/tmp/idev-sync}"
+REPO=$(jq -r '.apple_dev.repo' "$LOCK")
+PIN=$(jq -r '.apple_dev.commit' "$LOCK")
+HEAD=$(git ls-remote "$REPO" HEAD | cut -f1)
+[ -n "$HEAD" ] || { echo "upstream-status: upstream HEAD is empty" >&2; exit 1; }
+[ -n "$PIN" ] || { echo "upstream-status: pinned commit is empty" >&2; exit 1; }
+
+fetch() {
+    local repo="$1" commit="$2" dir="$3"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    git -C "$dir" init -q
+    git -C "$dir" fetch -q --depth 1 "$repo" "$commit"
+    git -C "$dir" checkout -q FETCH_HEAD
+}
+
+UP="$CACHE/upstream"
+fetch "$REPO" "$HEAD" "$UP"
+git -C "$UP" fetch -q --depth 1 "$REPO" "$PIN" 2>/dev/null || true
+SH="$UP/install-toolchain.sh"
+
+lock_xtool=$(jq -r '.apple_dev.xtool_sha' "$LOCK")
+lock_oam=$(jq -r '.apple_dev.oam_sha' "$LOCK")
+lock_rcs=$(jq -r '.apple_dev.rcodesign.version' "$LOCK")
+lock_ipsw=$(jq -r '.apple_dev.ipsw.version' "$LOCK")
+lock_stamp=$(jq -r '.apple_dev.sdk_stamp' "$LOCK")
+up_xtool=$(grep '^XTOOL_SHA=' "$SH" | cut -d= -f2-)
+up_oam=$(grep '^OAM_SHA=' "$SH" | cut -d= -f2-)
+up_rcs=$(grep '^RCODESIGN_VERSION=' "$SH" | cut -d= -f2)
+up_ipsw=$(grep '^IPSW_VERSION=' "$SH" | cut -d= -f2)
+up_stamp=$(grep '^XTOOL_SDK_VERSION=' "$SH" | cut -d= -f2- | tr -d '"')
+
+echo "apple-dev pinned $PIN"
+echo "apple-dev HEAD   $HEAD"
+echo
+echo "pins"
+printf '  %-12s %s -> %s\n' xtool "$lock_xtool" "$up_xtool"
+printf '  %-12s %s -> %s\n' oam "$lock_oam" "$up_oam"
+printf '  %-12s %s -> %s\n' rcodesign "$lock_rcs" "$up_rcs"
+printf '  %-12s %s -> %s\n' ipsw "$lock_ipsw" "$up_ipsw"
+printf '  %-12s %s -> %s\n' sdk-stamp "$lock_stamp" "$up_stamp"
+echo
+
+if [ "$PIN" = "$HEAD" ]; then
+    echo "no upstream changes"
+    exit 0
+fi
+
+echo "changed files"
+printf '  %-10s %-8s %s\n' group status path
+git -C "$UP" diff --name-status --no-renames "$PIN" HEAD |
+while IFS=$'\t' read -r status path; do
+    [ -n "$path" ] || continue
+    case "$path" in
+        install-toolchain.sh) group=pins ;;
+        flutter/*) group=flutter ;;
+        kmp/*) group=kmp ;;
+        tools/compat-suite.py|tools/push-demo.sh|tools/m5-install/test_*.py) group=excluded ;;
+        tools/*|ship.sh|device-run.sh|ship-mac.sh|sdk-free/*|simview/*|machoload/*) group=apple-tools ;;
+        tests/*|receipts/*|compat/*|patches/*|docs/*|.github/*|README.md|CHANGELOG.md|FINDINGS.md|AGENTS.md|CONTRIBUTING.md|CONTRIBUTORS.md|GETTING-STARTED.md|TRYOMARCHY-WINDOWS-USB.md) group=excluded ;;
+        *) group=review ;;
+    esac
+    printf '  %-10s %-8s %s\n' "$group" "$status" "$path"
+done
+
+echo
+echo "review the groups above with docs/UPSTREAM.md before touching the tree"

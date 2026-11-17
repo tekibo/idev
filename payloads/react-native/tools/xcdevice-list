@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""`xcrun xcdevice list` backed by the manager's connected-device list."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+
+def manager_devices() -> list[dict]:
+    idev = os.environ.get("IDEV_BIN", "")
+    if idev and os.path.isfile(idev):
+        result = subprocess.run(
+            [idev, "devices", "--json"],
+            capture_output=True,
+            text=True,
+            env=os.environ,
+        )
+        try:
+            data = json.loads(result.stdout)
+            if isinstance(data, list):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    xtool = os.path.join(os.environ.get("IDEV_HOME", ""), "bin", "xtool")
+    if not os.path.isfile(xtool):
+        return []
+    result = subprocess.run(
+        [xtool, "devices"],
+        capture_output=True,
+        text=True,
+        env=os.environ,
+    )
+    found = []
+    pattern = re.compile(r"^(.*?) \[[^\]]+\]: ([0-9A-Fa-f-]+)$")
+    for line in result.stdout.splitlines():
+        match = pattern.match(line.strip())
+        if match:
+            found.append({"name": match.group(1), "udid": match.group(2)})
+    return found
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if args and args[0] != "list":
+        print("xcdevice: only `list` is supported", file=sys.stderr)
+        return 2
+
+    devices = []
+    for device in manager_devices():
+        udid = device.get("udid") or device.get("identifier")
+        if not udid:
+            continue
+        devices.append(
+            {
+                "simulator": False,
+                "operatingSystemVersion": "",
+                "platform": "com.apple.platform.iphoneos",
+                "identifier": udid,
+                "name": device.get("name", ""),
+                "available": True,
+            }
+        )
+    print(json.dumps(devices))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

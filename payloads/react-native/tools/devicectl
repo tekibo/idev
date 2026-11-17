@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""`devicectl` on Linux, backed by xtool.
+
+Expo's iOS run flow talks to physical devices exclusively through
+`xcrun devicectl`:
+
+    xcrun devicectl --version
+    xcrun devicectl list devices --json-output <path> --timeout 5
+    xcrun devicectl device install app --device <udid> <app>
+    xcrun devicectl device process launch --terminate-existing --device <udid> <bundle-id>
+
+On Linux those commands are answered by `xtool`, which owns device transport
+and is the only signer in this pipeline: builds stay unsigned, and signing
+happens at install time.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+XTTOOL = os.environ.get("XCRUN_XTOOL", "xtool")
+PYMOBILEDEVICE3 = os.environ.get("XCRUN_PYMOBILEDEVICE3", "pymobiledevice3")
+
+
+def log(message: str) -> None:
+    print(f"devicectl: {message}", file=sys.stderr)
+
+
+def run(command: list[str], **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(command, capture_output=True, text=True, **kwargs)
+
+
+def usbmux_devices() -> list[dict]:
+    """Devices known to usbmuxd, as reported by pymobiledevice3."""
+    if not shutil.which(PYMOBILEDEVICE3):
+        log(f"{PYMOBILEDEVICE3} not found; no devices can be listed")
+        return []
+    try:
+        result = run([PYMOBILEDEVICE3, "usbmux", "list"], timeout=25)
+    except (OSError, subprocess.SubprocessError) as error:
+        log(f"could not query usbmuxd: {error}")
+        return []
+    if result.returncode != 0:
+        log((result.stderr or result.stdout).strip() or "usbmuxd query failed")
+        return []
+    try:
+        devices = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        log("usbmuxd returned malformed JSON")
+        return []
+    return [device for device in devices if isinstance(device, dict)]
+
+
+def is_paired(udid: str) -> bool:
+    """True when a valid pairing record exists for the device."""
+    if not shutil.which("idevicepair"):
+        # Assume paired: xtool pairs during install, and refusing to list the
+        # device would hide it from the CLI entirely.
+        return True
+    try:
+        result = run(["idevicepair", "validate", "-u", udid], timeout=25)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def device_entry(device: dict) -> dict | None:
+    udid = device.get("UniqueDeviceID") or device.get("Identifier")
+    if not udid:
+        return None
+    product_type = device.get("ProductType") or ""
+    connection = device.get("ConnectionType") or "USB"
+    platform = "iOS"
+    if product_type.startswith("Vision"):
+        platform = "xrOS"
+    return {
+        "identifier": udid,
+        "deviceProperties": {
+            "name": device.get("DeviceName") or product_type or udid,
+            "osVersionNumber": device.get("ProductVersion") or "",
+        },
+        "hardwareProperties": {
+            "udid": udid,
+            "productType": product_type,
+            "platform": platform,
+            "reality": "physical",
+        },
+        "connectionProperties": {
+            "pairingState": "paired" if is_paired(udid) else "unpaired",
+            "tunnelState": "connected",
+            "transportType": "localNetwork" if "network" in connection.lower() else "wired",
+        },
+    }
+
+
+def write_device_list(path: str) -> int:
+    entries = []
+    for device in usbmux_devices():
+        entry = device_entry(device)
+        if entry:
+            entries.append(entry)
+    payload = {"info": {"jsonVersion": 3}, "result": {"devices": entries}}
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    return 0
+
+
+def option_value(arguments: list[str], *names: str) -> str | None:
+    for index, argument in enumerate(arguments):
+        if argument in names and index + 1 < len(arguments):
+            return arguments[index + 1]
+        for name in names:
+            if argument.startswith(f"{name}="):
+                return argument.split("=", 1)[1]
+    return None
+
+
+def xtool(*arguments: str) -> int:
+    command = [XTTOOL, *arguments]
+    try:
+        process = subprocess.run(command)
+    except OSError as error:
+        log(f"cannot run {XTTOOL}: {error}")
+        return 127
+    return process.returncode
+
+
+def terminate_installed_app(udid: str, app_path: str) -> None:
+    """Stop the running copy before replacing it.
+
+    `installation_proxy` refuses to verify a replacement while the old
+    process is alive. Expo does not terminate the app before installing, so
+    the shim does it: this is the same app, being replaced by the new build.
+    """
+    try:
+        with open(os.path.join(app_path, "Info.plist"), "rb") as handle:
+            info = plistlib.load(handle)
+        bundle_id = info.get("CFBundleIdentifier")
+        if not bundle_id:
+            return
+        running = resolve_bundle_id(udid, bundle_id)
+        subprocess.run(
+            [PYMOBILEDEVICE3, "developer", "dvt", "pkill",
+             "--bundle", running],
+            capture_output=True, text=True,
+        )
+    except (OSError, plistlib.InvalidFileException, subprocess.SubprocessError) as error:
+        log(f"could not terminate the running app: {error}")
+
+
+def install_app(arguments: list[str]) -> int:
+    udid = option_value(arguments, "--device", "-d")
+    path = next((a for a in arguments if not a.startswith("-") and a != udid), None)
+    if not path:
+        log("install app: no app path given")
+        return 64
+    # The CLI parses `<n>%...` from stdout to drive its progress indicator.
+    print("  0%...")
+    sys.stdout.flush()
+    terminate_installed_app(udid, path)
+    target = ["--udid", udid] if udid else ["--usb"]
+    code = xtool("install", *target, path)
+    if code == 0:
+        print("100%...")
+        sys.stdout.flush()
+    return code
+
+
+def installed_bundle_ids(udid: str) -> list[str]:
+    """Bundle identifiers currently installed on the device."""
+    if not shutil.which(PYMOBILEDEVICE3):
+        return []
+    try:
+        result = run([PYMOBILEDEVICE3, "apps", "list", "--udid", udid], timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    apps = payload.get("Apps", payload) if isinstance(payload, dict) else payload
+    return [key for key in apps if isinstance(key, str)] if isinstance(apps, dict) else []
+
+
+def resolve_bundle_id(udid: str, bundle_id: str) -> str:
+    """Map a requested bundle id onto what was actually installed.
+
+    Free provisioning requires the app id to be prefixed with the team
+    (`XTL-<team>.<bundle>`), and xtool signs the app under that identifier.
+    The CLI still asks to launch the original identifier.
+    """
+    installed = installed_bundle_ids(udid)
+    if not installed:
+        return bundle_id
+    if bundle_id in installed:
+        return bundle_id
+    for candidate in installed:
+        if candidate.endswith(f".{bundle_id}") or candidate == bundle_id:
+            return candidate
+    return bundle_id
+
+
+def launch_app(arguments: list[str]) -> int:
+    udid = option_value(arguments, "--device", "-d")
+    bundle_id = next((a for a in arguments if not a.startswith("-") and a != udid), None)
+    if not bundle_id:
+        log("process launch: no bundle identifier given")
+        return 64
+    if not shutil.which(PYMOBILEDEVICE3):
+        log(f"{PYMOBILEDEVICE3} not found on PATH; cannot launch the app")
+        return 127
+    resolved = resolve_bundle_id(udid, bundle_id)
+    # xtool remains the signer and installer, but its debugserver launch
+    # handshake fails on this device. CoreDevice launches the installed app
+    # without attaching a debugger, which is what Expo's run flow needs.
+    command = [
+        PYMOBILEDEVICE3, "developer", "core-device",
+        "launch-application", resolved, "--kill-existing",
+    ]
+    process = subprocess.run(command)
+    return process.returncode
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in {"--version", "version"}:
+        print("devicectl 1.0 (xtool backend)")
+        return 0
+    if not shutil.which(XTTOOL):
+        log(f"{XTTOOL} not found on PATH; cannot control devices")
+        return 127
+
+    command = argv[0]
+    rest = argv[1:]
+
+    if command in {"list", "list-devices"}:
+        path = option_value(rest, "--json-output")
+        if path:
+            return write_device_list(path)
+        # Human-readable form, only used interactively.
+        for device in usbmux_devices():
+            udid = device.get("UniqueDeviceID") or device.get("Identifier") or "?"
+            print(f"{device.get('DeviceName', 'device')}  {udid}")
+        return 0
+
+    if command == "device":
+        if not rest:
+            log("device: missing subcommand")
+            return 64
+        action = rest[0]
+        tail = rest[1:]
+        if action == "install":
+            if tail and tail[0] == "app":
+                return install_app(tail[1:])
+            log("device install: only `app` is supported")
+            return 64
+        if action == "process":
+            if tail and tail[0] == "launch":
+                return launch_app(tail[1:])
+            log("device process: only `launch` is supported")
+            return 64
+        log(f"device {action}: not supported on Linux")
+        return 64
+
+    log(f"unknown command: {command}")
+    return 64
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

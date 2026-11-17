@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# ld64.lld with Xcode's fatal-warning flag removed.
+#
+# LLD warns "This version of lld does not support linking for platform iOS"
+# and still links correctly. Xcode passes -fatal_warnings, which promotes that
+# warning to an error and aborts the link. The flag is dropped here; the SDK's
+# own linker is used when present because it also handles relocatable links.
+set -uo pipefail
+
+SDK_TOOLSET="${I_DEV_SDK_TOOLSET:-}"
+if [ -z "$SDK_TOOLSET" ]; then
+    [ -n "${DARWIN_SDK_BUNDLE:-}" ] || { echo "ld64.lld: DARWIN_SDK_BUNDLE not set; run idev doctor" >&2; exit 2; }
+    SDK_TOOLSET="$DARWIN_SDK_BUNDLE/toolset/bin"
+fi
+LINKER="${I_DEV_LD64:-}"
+if [ -z "$LINKER" ] && [ -x "$SDK_TOOLSET/ld64.lld" ]; then
+    LINKER="$SDK_TOOLSET/ld64.lld"
+fi
+if [ -z "$LINKER" ]; then
+    echo "ld64.lld: no linker at $SDK_TOOLSET/ld64.lld" >&2
+    exit 2
+fi
+
+args=()
+for argument in "$@"; do
+    case "$argument" in
+        -fatal_warnings|--fatal-warnings) continue ;;
+    esac
+    args+=("$argument")
+done
+
+exec "$LINKER" "${args[@]}"

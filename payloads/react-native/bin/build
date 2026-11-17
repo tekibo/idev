@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Runs the Expo build engine with a Developer directory Swift Build can use.
+#
+# Everything Swift Build cannot derive on Linux is prepared here: the
+# toolchain overlay, CocoaPods xcframework staging, generated codegen, and
+# failure detection. The installed SDK is never modified.
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+ROOT="${IDEV_HOME:-$(cd "$HERE/../.." && pwd)}"
+BIN="${EXPO_BUILD_BIN:-$ROOT/bin/expo-build-bin}"
+OVERLAY_TOOL="${EXPO_OVERLAY_TOOL:-$HERE/../tools/developer-overlay}"
+
+args=("$@")
+developer="${DEVELOPER_DIR:-}"
+filtered=()
+index=0
+while [ $index -lt ${#args[@]} ]; do
+    if [ "${args[$index]}" = "--developer-dir" ] && [ $((index + 1)) -lt ${#args[@]} ]; then
+        developer="${args[$((index + 1))]}"
+        index=$((index + 2))
+        continue
+    fi
+    filtered+=("${args[$index]}")
+    index=$((index + 1))
+done
+
+pif=""
+for ((i = 0; i < ${#filtered[@]}; i++)); do
+    if [ "${filtered[$i]}" = "--pif" ] && [ $((i + 1)) -lt ${#filtered[@]} ]; then
+        pif="${filtered[$((i + 1))]}"
+    fi
+done
+
+# The PIF records project.pbxproj paths, so the project directory is two
+# levels up from there.
+ios_dir=""
+if [ -n "$pif" ] && [ -f "$pif" ]; then
+    ios_dir="$(python3 "$HERE/pif-ios-dir" "$pif" 2>/dev/null || true)"
+fi
+
+# A cleared build directory takes React Native's generated codegen with it.
+if [ -n "$ios_dir" ] && [ -d "$ios_dir/Pods" ] && [ ! -d "$ios_dir/build/generated" ]; then
+    echo "note: generated codegen missing; running pod install"
+    ( cd "$ios_dir" && pod install ) || exit 1
+fi
+
+if [ -z "$developer" ]; then
+    [ -n "${DARWIN_SDK_BUNDLE:-}" ] || { echo "expo-build: DARWIN_SDK_BUNDLE not set; run idev doctor" >&2; exit 2; }
+    developer="$DARWIN_SDK_BUNDLE/Developer"
+fi
+[ -n "$developer" ] || { echo "expo-build: Darwin SDK not found; set DEVELOPER_DIR" >&2; exit 2; }
+
+# SwiftPM resolves `--swift-sdk darwin` through XDG_CONFIG_HOME. The overlay
+# replaces DEVELOPER_DIR for the compiler, so keep the real bundle under a
+# separate name for the SPM staging tools.
+if [ -f "$(dirname "$developer")/info.json" ]; then
+    export DARWIN_SDK_BUNDLE="$(cd "$(dirname "$developer")" && pwd)"
+fi
+
+overlay="${EXPO_DEVELOPER_OVERLAY:-}"
+if [ -z "$overlay" ]; then
+    # Each build gets its own overlay. A shared /tmp/expo-developer is torn
+    # down and rebuilt by every expo-build, which makes concurrent Expo and
+    # Bare RN builds lose SDK headers mid-compile.
+    overlay="$(mktemp -d "${TMPDIR:-/tmp}/idev-overlay.XXXXXX")"
+    trap 'rm -rf "$overlay"' EXIT
+fi
+python3 "$OVERLAY_TOOL" "$developer" "$overlay" || exit 2
+
+# Tools layered over the toolchain (ditto, lipo, ipconfig, ...) live beside
+# this script; script phases inherit PATH, so they see them too.
+export PATH="$HERE/../tools:$HERE:$PATH"
+
+export SWBBUILDSERVICE_PATH="${SWBBUILDSERVICE_PATH:-$ROOT/bin/SWBBuildService}"
+export DEVELOPER_DIR="$overlay"
+
+# CocoaPods stages vendored xcframeworks from a script phase Swift Build will
+# not have run before the compiles that need them.
+if [ -n "$pif" ] && [ -f "$(dirname "$pif")/build-parameters.json" ]; then
+    python3 "$HERE/../tools/stage-xcframeworks" \
+        --pif "$pif" \
+        --parameters "$(dirname "$pif")/build-parameters.json" || exit 2
+fi
+
+output="$(mktemp)"
+trap 'rm -f "$output"' EXIT
+"$BIN" --developer-dir "$overlay" "${filtered[@]}" | tee "$output"
+status=${PIPESTATUS[0]}
+
+# A build can fail without emitting a diagnostic of its own.
+if grep -q '"buildCompleted"[^}]*"result":"failed"' "$output" ||
+   grep -q '"buildCompleted"[^}]*"result":"cancelled"' "$output"; then
+    status=1
+fi
+
+# CocoaPods embeds every vendored framework, including pods built as static
+# frameworks. Those are already inside the executable, and their `ar` archive
+# is not a Mach-O image, so signers reject the bundle at install time.
+if [ "$status" -eq 0 ] && [ -n "$pif" ] && [ -f "$pif" ]; then
+    python3 "$HERE/../tools/patch-ipad-orientations" \
+        --derived "$(dirname "$pif")" \
+        --app-root "$(dirname "$ios_dir")" || status=1
+    python3 "$HERE/../tools/prune-static-frameworks" --derived "$(dirname "$pif")" || true
+    # A bundle whose @rpath dependencies are not all embedded builds fine and
+    # then dies in dyld on the device. Catch that here instead.
+    python3 "$HERE/../tools/audit-app-closure" --derived "$(dirname "$pif")" || status=1
+fi
+
+exit "$status"

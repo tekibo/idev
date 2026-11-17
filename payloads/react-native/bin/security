@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# security shim for i-dev transparent macOS compatibility
+for arg in "$@"; do
+    case "$arg" in
+        find-identity)
+            echo '     0 valid identities found'
+            exit 0
+            ;;
+        find-certificate)
+            exit 0
+            ;;
+    esac
+done
+exit 0

@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Build the CLI binaries, component archives, GitHub release manifest, and checksums.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="${1:-$ROOT/dist}"
+CACHE="${IDEV_SYNC_CACHE:-/var/tmp/idev-sync}"
+VERSION=$(grep 'const Version =' "$ROOT/internal/platform/manifest/manifest.go" | cut -d'"' -f2)
+
+for tool in xcrun command clang-darwin clang++-darwin osascript defaults security xcode-select; do
+    [ -x "$ROOT/payloads/react-native/bin/$tool" ] || {
+        echo "release: payloads/react-native/bin/$tool is not executable" >&2
+        exit 1
+    }
+done
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+
+build() {
+    local arch="$1" dir="$OUT/idev-linux-$1"
+    mkdir -p "$dir"
+    (cd "$ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+        go build -trimpath -ldflags '-s -w' -o "$dir/idev" ./cmd/idev)
+    tar -czf "$OUT/idev-linux-$arch.tar.gz" -C "$dir" idev
+    echo "release: idev-linux-$arch"
+}
+build amd64
+build arm64
+
+tar -czf "$OUT/react-native-$VERSION.tar.gz" -C "$ROOT/payloads" react-native
+tar -czf "$OUT/apple-tools-$VERSION.tar.gz" -C "$ROOT/payloads" \
+    --exclude='apple-tools/darwin-tools/.build' --exclude='apple-tools/oam/.build' \
+    --exclude='apple-tools/simview/build' --exclude='apple-tools/machoload/.build' apple-tools
+tar -czf "$OUT/flutter-$VERSION.tar.gz" -C "$ROOT/payloads" flutter
+tar -czf "$OUT/kmp-$VERSION.tar.gz" -C "$ROOT/payloads" kmp
+
+"$ROOT/scripts/build-sources" "$OUT" "$CACHE"
+"$ROOT/scripts/write-manifest" "$OUT" "$VERSION"
+cp "$ROOT/install.sh" "$OUT/install.sh"
+
+(
+    cd "$OUT"
+    find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\0' | sort -z | xargs -0 sha256sum > SHA256SUMS
+)
+echo "release: $OUT"
+echo "release: manifest $OUT/manifest.json"

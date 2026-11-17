@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Linux/Ruby compatibility shim: Ruby backticks execute `command -v x` as a
+# direct binary lookup instead of going through a shell. Delegate to the bash
+# builtin so React Native CocoaPods scripts work unchanged.
+if [ "${1:-}" = "-v" ] || [ "${1:-}" = "-V" ]; then
+  shift
+  command -v "$@"
+  exit $?
+fi
+exec "$@"

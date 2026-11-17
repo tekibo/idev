@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Print the iOS project directory recorded in a PIF file."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: pif-ios-dir <pif>", file=sys.stderr)
+        return 2
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        objects = json.load(handle)
+    for item in objects:
+        if item.get("type") != "project":
+            continue
+        path = item.get("contents", {}).get("path", "")
+        if path.endswith("project.pbxproj"):
+            print(os.path.dirname(os.path.dirname(path)))
+            return 0
+        if path.endswith(".xcodeproj"):
+            print(os.path.dirname(path))
+            return 0
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

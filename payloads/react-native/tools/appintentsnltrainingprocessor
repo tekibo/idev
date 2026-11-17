@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Xcode's App Intents processors, backed by the Apple tooling implementation.
+
+`appintentsmeta.py` accepts the arguments that matter and produces the same
+metadata files. Xcode's build tasks also pass a number of toolchain and
+dependency-tracking flags it does not model, so those are dropped here instead
+of failing the step.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+
+import swiftenv
+
+SUPPORTED = {
+    "--binary-file",
+    "--bundle-identifier",
+    "--const-values",
+    "--info-plist",
+    "--module-name",
+    "--output",
+    "--platform-family",
+    "--sdk-root",
+    "--ssu-resources",
+    "--swift-const-vals-list",
+    "--timestamp",
+    "--xcode-version",
+}
+
+ROOT = swiftenv.apple_tools_root()
+TOOL = os.path.join(ROOT, "tools", "appintentsmeta.py") if ROOT else ""
+
+
+def filter_arguments(argv: list[str]) -> list[str]:
+    kept: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if not token.startswith("--"):
+            index += 1
+            continue
+        name = token.split("=", 1)[0]
+        if name in SUPPORTED:
+            kept.append(token)
+            if "=" not in token and index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+                kept.append(argv[index + 1])
+                index += 1
+        elif "=" not in token and index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+            index += 1  # drop the unsupported flag and its value
+        index += 1
+    return kept
+
+
+def binary_is_archive(arguments: list[str]) -> bool:
+    for index, token in enumerate(arguments):
+        if token == "--binary-file" and index + 1 < len(arguments):
+            path = arguments[index + 1]
+            try:
+                with open(path, "rb") as handle:
+                    return handle.read(8).startswith(b"!<arch>")
+            except OSError:
+                return False
+        if token.startswith("--binary-file="):
+            path = token.split("=", 1)[1]
+            try:
+                with open(path, "rb") as handle:
+                    return handle.read(8).startswith(b"!<arch>")
+            except OSError:
+                return False
+    return False
+
+
+def main() -> int:
+    if not TOOL or not os.path.isfile(TOOL):
+        print("error: private appintentsmeta.py not found; set IDEV_APPLE_TOOLS", file=sys.stderr)
+        return 1
+    arguments = filter_arguments(sys.argv[1:])
+    # Targets without App Intents are invoked without the required inputs;
+    # there is nothing to extract, so succeeding is correct.
+    required = {"--module-name", "--bundle-identifier", "--output", "-m", "-o", "-b"}
+    if not required.intersection(arguments):
+        return 0
+    # Static pod libraries carry no App Intents metadata; Apple's tool accepts
+    # them because it only ever runs where the build system asked.
+    if binary_is_archive(arguments):
+        return 0
+    return subprocess.run([sys.executable, TOOL] + arguments).returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Write the GitHub release manifest from the built assets and the pin lock.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="${1:?usage: write-manifest OUT VERSION}"
+VERSION="${2:?usage: write-manifest OUT VERSION}"
+LOCK="$ROOT/internal/platform/config/sources.lock"
+
+APPLE_DEV=$(jq -r '.apple_dev.commit' "$LOCK")
+XTOOL_SHA=$(jq -r '.apple_dev.xtool_sha' "$LOCK")
+RCS_VERSION=$(jq -r '.apple_dev.rcodesign.version' "$LOCK")
+RCS_AMD64_URL=$(jq -r '.apple_dev.rcodesign.amd64.url' "$LOCK")
+RCS_AMD64_SHA=$(jq -r '.apple_dev.rcodesign.amd64.sha256' "$LOCK")
+RCS_ARM64_URL=$(jq -r '.apple_dev.rcodesign.arm64.url' "$LOCK")
+RCS_ARM64_SHA=$(jq -r '.apple_dev.rcodesign.arm64.sha256' "$LOCK")
+IPSW_VERSION=$(jq -r '.apple_dev.ipsw.version' "$LOCK")
+IPSW_AMD64_URL=$(jq -r '.apple_dev.ipsw.amd64.url' "$LOCK")
+IPSW_AMD64_SHA=$(jq -r '.apple_dev.ipsw.amd64.sha256' "$LOCK")
+IPSW_ARM64_URL=$(jq -r '.apple_dev.ipsw.arm64.url' "$LOCK")
+IPSW_ARM64_SHA=$(jq -r '.apple_dev.ipsw.arm64.sha256' "$LOCK")
+SB_SHA=$(jq -r '.idev.swift_build.sha' "$LOCK")
+
+sha() { sha256sum "$OUT/$1" | cut -d' ' -f1; }
+
+cat > "$OUT/manifest.json" <<EOF
+{
+  "version": "$VERSION",
+  "components": {
+    "idev-linux-amd64": {
+      "version": "$VERSION",
+      "url": "idev-linux-amd64.tar.gz",
+      "sha256": "$(sha "idev-linux-amd64.tar.gz")",
+      "pin_source": "idev"
+    },
+    "idev-linux-arm64": {
+      "version": "$VERSION",
+      "url": "idev-linux-arm64.tar.gz",
+      "sha256": "$(sha "idev-linux-arm64.tar.gz")",
+      "pin_source": "idev"
+    },
+    "react-native": {
+      "version": "$VERSION",
+      "url": "react-native-$VERSION.tar.gz",
+      "sha256": "$(sha "react-native-$VERSION.tar.gz")",
+      "pin_source": "idev"
+    },
+    "apple-tools": {
+      "version": "$APPLE_DEV",
+      "url": "apple-tools-$VERSION.tar.gz",
+      "sha256": "$(sha "apple-tools-$VERSION.tar.gz")",
+      "pin_source": "apple-dev"
+    },
+    "flutter": {
+      "version": "$APPLE_DEV",
+      "url": "flutter-$VERSION.tar.gz",
+      "sha256": "$(sha "flutter-$VERSION.tar.gz")",
+      "pin_source": "apple-dev"
+    },
+    "kmp": {
+      "version": "$APPLE_DEV",
+      "url": "kmp-$VERSION.tar.gz",
+      "sha256": "$(sha "kmp-$VERSION.tar.gz")",
+      "pin_source": "apple-dev"
+    },
+    "xtool": {
+      "version": "$XTOOL_SHA",
+      "url": "xtool-source-$XTOOL_SHA.tar.gz",
+      "sha256": "$(sha "xtool-source-$XTOOL_SHA.tar.gz")",
+      "pin_source": "apple-dev"
+    },
+    "rcodesign-amd64": {
+      "version": "$RCS_VERSION",
+      "url": "$RCS_AMD64_URL",
+      "sha256": "$RCS_AMD64_SHA",
+      "pin_source": "apple-dev"
+    },
+    "rcodesign-arm64": {
+      "version": "$RCS_VERSION",
+      "url": "$RCS_ARM64_URL",
+      "sha256": "$RCS_ARM64_SHA",
+      "pin_source": "apple-dev"
+    },
+    "ipsw-amd64": {
+      "version": "$IPSW_VERSION",
+      "url": "$IPSW_AMD64_URL",
+      "sha256": "$IPSW_AMD64_SHA",
+      "pin_source": "apple-dev"
+    },
+    "ipsw-arm64": {
+      "version": "$IPSW_VERSION",
+      "url": "$IPSW_ARM64_URL",
+      "sha256": "$IPSW_ARM64_SHA",
+      "pin_source": "apple-dev"
+    },
+    "swift-build": {
+      "version": "$SB_SHA",
+      "url": "swift-build-source-$SB_SHA.tar.gz",
+      "sha256": "$(sha "swift-build-source-$SB_SHA.tar.gz")",
+      "pin_source": "idev"
+    }
+  }
+}
+EOF

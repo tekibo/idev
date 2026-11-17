@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -u
+
+failed=0
+ROOTS=(cmd internal payloads)
+fail() {
+    echo "architecture: $*" >&2
+    failed=1
+}
+
+check_line_limit() {
+    local hits
+    hits=$(find "${ROOTS[@]}" -name '*.go' -type f -exec wc -l {} + 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $2 != "total" && $1 > 120 {print $2}')
+    [ -z "$hits" ] || fail "files over 120 lines: $hits"
+}
+
+check_paths() {
+    local hits
+    hits=$(grep -RInE '/idev/bin|/idev/opt|/idev/\.config|/home/developer|/usr/lib/swift' internal cmd payloads/react-native 2>/dev/null || true)
+    [ -z "$hits" ] || fail "hardcoded container path: $hits"
+}
+
+check_exec() {
+    local hits
+    hits=$(grep -RIn 'exec.Command' internal cmd 2>/dev/null | grep -v 'internal/platform/execx/' || true)
+    [ -z "$hits" ] || fail "exec.Command outside internal/platform/execx: $hits"
+}
+
+check_tests() {
+    local hits
+    hits=$(find . -name '*_test.go' -not -path './.git/*' 2>/dev/null)
+    [ -z "$hits" ] || fail "test file present: $hits"
+}
+
+check_aur() {
+    local hits
+    hits=$(grep -RInE '\b(yay|paru|makepkg)\b|pacman -U|pacman -Syu' internal cmd payloads/react-native scripts 2>/dev/null | grep -v 'scripts/check-architecture:' || true)
+    [ -z "$hits" ] || fail "AUR command and upgrade command: $hits"
+}
+
+check_bundle() {
+    local hits
+    hits=$(grep -RInE 'com\.tekibo\.(healthbox|growpad)' internal cmd payloads/react-native 2>/dev/null || true)
+    [ -z "$hits" ] || fail "app bundle ID in engine: $hits"
+}
+
+check_shape() {
+    [ ! -d expo ] || fail "old expo/ directory still present"
+    [ -d payloads/react-native ] || fail "payloads/react-native missing"
+    [ ! -f main.go ] || fail "root main.go still present"
+}
+
+check_format() {
+    local hits
+    hits=$(gofmt -l "${ROOTS[@]}" 2>/dev/null || true)
+    [ -z "$hits" ] || fail "gofmt: $hits"
+}
+
+check_package_comments() {
+    local dir
+    for dir in $(find "${ROOTS[@]}" -name '*.go' -type f -exec dirname {} \; | sort -u); do
+        if ! grep -qE '^// (Package|Command) ' "$dir"/*.go; then
+            fail "missing package comment: $dir"
+        fi
+    done
+}
+
+check_line_limit
+check_paths
+check_exec
+check_tests
+check_aur
+check_bundle
+check_shape
+check_format
+check_package_comments
+if [ -x scripts/check-imports ]; then
+    check_imports() { scripts/check-imports; }
+    check_imports || fail "import boundary"
+fi
+
+[ "$failed" -eq 0 ]

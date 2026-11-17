@@ -1,0 +1,12 @@
+/idev
+/dist/
+*.log
+*.ipa
+*.app
+.DS_Store
+xcode/*.xip
+__pycache__/
+*.pyc
+.ninja_deps
+.ninja_log
+.build/

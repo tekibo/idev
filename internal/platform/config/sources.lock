@@ -1,0 +1,42 @@
+{
+  "apple_dev": {
+    "repo": "https://github.com/joshuaswarren/omarchy-apple-dev",
+    "commit": "d0f4980cb39c43ee75506811435f1bacf0b10816",
+    "xtool_repo": "https://github.com/joshuaswarren/xtool",
+    "xtool_sha": "7cc56c391a67652e86d164eddbbd62065a26599f",
+    "oam_repo": "https://github.com/joshuaswarren/OpenAppleMacros",
+    "oam_sha": "cb003a1763b08947dd37376ed8240cbfb4745c32",
+    "sdk_stamp": "epoch=4,darwinTools=1.1.0,oam=1.4.1",
+    "rcodesign": {
+      "version": "0.29.0",
+      "amd64": {
+        "url": "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.29.0/apple-codesign-0.29.0-x86_64-unknown-linux-musl.tar.gz",
+        "sha256": "dbe85cedd8ee4217b64e9a0e4c2aef92ab8bcaaa41f20bde99781ff02e600002"
+      },
+      "arm64": {
+        "url": "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F0.29.0/apple-codesign-0.29.0-aarch64-unknown-linux-musl.tar.gz",
+        "sha256": "4af92c87ddf52f5f2d1258a3b4e56c7dcb8f1b2468df744976c5f139e031961f"
+      }
+    },
+    "ipsw": {
+      "version": "3.1.743",
+      "amd64": {
+        "url": "https://github.com/blacktop/ipsw/releases/download/v3.1.743/ipsw_3.1.743_linux_x86_64.tar.gz",
+        "sha256": "56e9ba754781dfeaa3b84f733ad25e63ef8e2683214a321e06b31a0d85f95e4c"
+      },
+      "arm64": {
+        "url": "https://github.com/blacktop/ipsw/releases/download/v3.1.743/ipsw_3.1.743_linux_arm64.tar.gz",
+        "sha256": "c7976f40d648ede62bc2d8bb80b5e57ab6365d5ba531a917a3515466a753c21e"
+      }
+    }
+  },
+  "idev": {
+    "pymobiledevice3": "11.58.0",
+    "cocoapods": "1.17.0",
+    "erb": "4.0.4.1",
+    "swift_build": {
+      "repo": "https://github.com/swiftlang/swift-build",
+      "sha": "2d847030c63961cb1cf8cbb6ad2bc7245fdfeb09"
+    }
+  }
+}

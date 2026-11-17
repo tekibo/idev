@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Print throttled build progress from the Swift Build JSON stream.
+
+The JSON stream remains on stdout for the Expo CLI. Human-readable progress
+goes to stderr and, when IDEV_BUILD_PROGRESS is set, to a side-channel file
+that the expo wrapper tails to the terminal.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+
+last_target = ""
+last_percent = -1
+last_time = 0.0
+progress_file = None
+
+
+def emit(text: str) -> None:
+    sys.stderr.write(text + "\n")
+    sys.stderr.flush()
+    if progress_file is not None:
+        progress_file.write(text + "\n")
+        progress_file.flush()
+
+
+def handle(line: str) -> None:
+    global last_target, last_percent, last_time
+    text = line.rstrip("\n")
+    if not text.startswith("{"):
+        return
+    try:
+        event = json.loads(text)
+    except json.JSONDecodeError:
+        return
+    kind = event.get("kind")
+    if kind == "targetStarted":
+        name = event.get("name") or ""
+        last_target = name
+        last_percent = -1
+        last_time = time.monotonic()
+        emit(f"[target] {name}")
+    elif kind == "didUpdateProgress":
+        percent = event.get("percentComplete")
+        if percent is None:
+            return
+        target = event.get("targetName") or ""
+        now = time.monotonic()
+        percent = int(percent)
+        if target != last_target or percent >= last_percent + 5 or now - last_time >= 5:
+            last_target = target
+            last_percent = percent
+            last_time = now
+            message = event.get("message") or ""
+            emit(f"[{percent:3d}%] {target} {message}".rstrip())
+    elif kind == "buildCompleted":
+        result = event.get("result") or "unknown"
+        emit(f"[build] {result}")
+
+
+def main() -> int:
+    global progress_file
+    path = os.environ.get("IDEV_BUILD_PROGRESS", "")
+    if path:
+        try:
+            progress_file = open(path, "a", encoding="utf-8")
+        except OSError:
+            progress_file = None
+    try:
+        for line in sys.stdin:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            handle(line)
+    finally:
+        if progress_file is not None:
+            progress_file.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Map the xcrun-discovered C++ compiler onto the native xcrun shim.
+here=$(dirname "$(readlink -f "$0")")
+sdk="${SDKROOT:-iphoneos}"
+case "$sdk" in
+    *iPhoneSimulator*) sdk=iphonesimulator ;;
+    *MacOSX*) sdk=macosx ;;
+esac
+exec "$here/xcrun" --sdk "$sdk" clang++ "$@"

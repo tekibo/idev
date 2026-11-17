@@ -1,0 +1,855 @@
+#!/usr/bin/env python3
+"""`xcodebuild -dumpPIF` for Linux.
+
+    dump-pif <out.json> -workspace <path> | -project <path> [--configuration NAME]
+
+Reads the workspace and its projects, then writes the PIF document Swift Build
+consumes. This is the only piece Xcode's closed front end normally supplies.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+import swiftenv
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lib import pif as piflib  # noqa: E402
+from lib import xcconfig  # noqa: E402
+from lib import xcodeproj  # noqa: E402
+
+
+_HOST_MACRO_CACHE: dict[str, str | None] = {}
+_BUILD_PRODUCTS_DIRS: dict[str, str] = {}
+
+
+def host_macro_binary(macro_path: str) -> str | None:
+    """Resolve the host build of an `expo-modules-macros` Swift plugin.
+
+    CocoaPods writes the macOS plugin path into OTHER_SWIFT_FLAGS. The same
+    package resolves an optional per-platform binary; ask it directly so both
+    npm and pnpm layouts work.
+    """
+    normalized = macro_path.replace("\\", "/")
+    suffix = "/expo-modules-macros/apple/ExpoModulesMacros"
+    if not normalized.endswith(suffix):
+        return None
+    package_root = normalized[: -len("/apple/ExpoModulesMacros")]
+    if package_root in _HOST_MACRO_CACHE:
+        return _HOST_MACRO_CACHE[package_root]
+
+    host = None
+    environment = os.environ.copy()
+    environment.pop("NODE_OPTIONS", None)
+    script = "process.stdout.write(require(process.argv[1]).getScannerBinaryPath())"
+    try:
+        result = subprocess.run(
+            ["node", "-e", script, package_root],
+            capture_output=True, text=True, env=environment,
+        )
+        candidate = result.stdout.strip()
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            host = candidate
+    except OSError:
+        pass
+
+    if host is None:
+        node_modules = os.path.dirname(package_root)
+        patterns = [
+            os.path.join(node_modules, "@expo", "modules-macros-linux-*", "ExpoModulesMacros"),
+            os.path.join(
+                node_modules, ".pnpm", "@expo+modules-macros-linux-*",
+                "node_modules", "@expo", "modules-macros-linux-*", "ExpoModulesMacros",
+            ),
+        ]
+        for pattern in patterns:
+            for candidate in sorted(glob.glob(pattern)):
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    host = candidate
+                    break
+            if host:
+                break
+
+    _HOST_MACRO_CACHE[package_root] = host
+    return host
+
+
+def replace_host_macros(settings: dict[str, str]) -> None:
+    """Point Swift macro plugin flags at the host build when one exists."""
+    pattern = re.compile(
+        r'("(?:[^"\\]|\\.)*/expo-modules-macros/apple/ExpoModulesMacros"'
+        r'|[^\s"]*/expo-modules-macros/apple/ExpoModulesMacros)'
+    )
+
+    def replace(match: re.Match[str]) -> str:
+        token = match.group(0)
+        quoted = token.startswith('"')
+        macro_path = token[1:-1] if quoted else token
+        host = host_macro_binary(macro_path)
+        if not host:
+            return token
+        return f'"{host}"' if quoted else host
+
+    for key in ("OTHER_SWIFT_FLAGS", "SWIFT_FLAGS", "OTHER_CFLAGS", "OTHER_CPLUSPLUSFLAGS"):
+        value = settings.get(key)
+        if value and "expo-modules-macros/apple/ExpoModulesMacros" in value:
+            settings[key] = pattern.sub(replace, value)
+
+
+def staged_framework_paths(value: str) -> str:
+    """Add the device slice directories of any `.xcframework` search path.
+
+    CocoaPods points FRAMEWORK_SEARCH_PATHS at a directory holding
+    `Foo.xcframework`. Clang cannot pick a slice on its own, so Xcode stages
+    the platform slice first; here the slice directory is added directly so
+    `<Foo/Header.h>` resolves.
+    """
+    tokens = shlex.split(value)
+    result: list[str] = []
+    for token in tokens:
+        if os.path.isdir(token):
+            for name in sorted(os.listdir(token)):
+                if not name.endswith(".xcframework"):
+                    continue
+                for slice_name in ("ios-arm64", "iphoneos-arm64", "ios-arm64_x86_64-simulator"):
+                    slice_dir = os.path.join(token, name, slice_name)
+                    if os.path.isdir(slice_dir) and slice_dir not in result:
+                        result.append(slice_dir)
+                        break
+        if token not in result:
+            result.append(token)
+    return " ".join(f'"{item}"' if " " in item else item for item in result)
+
+
+def find_linux_hermesc(ios_dir: str) -> str:
+    """Locate the Linux hermesc shipped by the hermes-compiler npm package.
+
+    react-native-xcode.sh hardcodes the macOS binary name (`osx-bin`) unless
+    HERMES_CLI_PATH is set, so the supported override is used instead of
+    touching the installed package.
+
+    `glob("**")` is not used here: it skips dot-directories, and pnpm keeps
+    every package under `node_modules/.pnpm`.
+    """
+    roots: list[str] = []
+    directory = os.path.abspath(ios_dir)
+    for _ in range(6):
+        roots.append(directory)
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+
+    for root in roots:
+        node_modules = os.path.join(root, "node_modules")
+        direct = os.path.join(node_modules, "hermes-compiler", "hermesc", "linux64-bin", "hermesc")
+        if os.path.isfile(direct):
+            return direct
+        pnpm = os.path.join(node_modules, ".pnpm")
+        if not os.path.isdir(pnpm):
+            continue
+        for name in os.listdir(pnpm):
+            if not name.startswith("hermes-compiler@"):
+                continue
+            candidate = os.path.join(
+                pnpm, name, "node_modules", "hermes-compiler", "hermesc",
+                "linux64-bin", "hermesc",
+            )
+            if os.path.isfile(candidate):
+                return candidate
+    return ""
+
+
+def staged_header_paths(value: str) -> list[str]:
+    """Header directories inside the device slices of any xcframework."""
+    result: list[str] = []
+    for token in shlex.split(value):
+        if not os.path.isdir(token):
+            continue
+        for name in sorted(os.listdir(token)):
+            if not name.endswith(".xcframework"):
+                continue
+            for slice_name in ("ios-arm64", "iphoneos-arm64", "ios-arm64_x86_64-simulator"):
+                slice_dir = os.path.join(token, name, slice_name)
+                if not os.path.isdir(slice_dir):
+                    continue
+                for candidate in (
+                    os.path.join(slice_dir, "Headers"),
+                    os.path.join(slice_dir, name[: -len(".xcframework")] + ".framework", "Headers"),
+                ):
+                    if os.path.isdir(candidate) and candidate not in result:
+                        result.append(candidate)
+                break
+    return result
+
+
+def staged_library_paths(value: str) -> list[str]:
+    """Directories inside xcframework slices that hold static libraries."""
+    result: list[str] = []
+    for token in shlex.split(value):
+        if not os.path.isdir(token):
+            continue
+        for name in sorted(os.listdir(token)):
+            if not name.endswith(".xcframework"):
+                continue
+            for slice_name in ("ios-arm64", "iphoneos-arm64", "ios-arm64_x86_64-simulator"):
+                slice_dir = os.path.join(token, name, slice_name)
+                if not os.path.isdir(slice_dir):
+                    continue
+                for root, _dirs, files in os.walk(slice_dir):
+                    if any(file.endswith(".a") for file in files) and root not in result:
+                        result.append(root)
+                break
+    return result
+
+
+def imports_swift_header(srcroot: str, module: str) -> bool:
+    """True when the pod's own sources import `<Module/Module-Swift.h>`.
+
+    Generating a compatibility header for every module pod pulls C++ interop
+    template machinery into module maps that do not need it, which is what
+    makes Debug builds recurse.
+    """
+    if not srcroot or not os.path.isdir(srcroot):
+        return True
+    needles = (
+        f"<{module}/{module}-Swift.h>",
+        f'"{module}-Swift.h"',
+        f"<{module}-Swift.h>",
+    )
+    for root, _dirs, files in os.walk(srcroot):
+        for name in files:
+            if not name.endswith((".m", ".mm", ".h", ".hpp", ".cpp", ".cc")):
+                continue
+            try:
+                with open(os.path.join(root, name), "r", errors="replace") as handle:
+                    text = handle.read()
+            except OSError:
+                continue
+            if any(needle in text for needle in needles):
+                return True
+    return False
+
+
+def swift_header_consumers(project: xcodeproj.Project) -> set[str]:
+    """Modules whose generated Swift header ObjC/C++ sources consume.
+
+    Only two forms count: an Objective-C module import (`@import Module;`)
+    and an explicit `<Module>/<Module>-Swift.h` reference. A Swift
+    `import Module` uses the Swift module directly. A C++ `#import
+    <Module/header.hpp>` imports the C++ API, not the generated Swift header.
+    Treating either as a compatibility-header consumer pulls C++ interop
+    templates into module maps that do not need them.
+    """
+    names: set[str] = set()
+    seen: set[str] = set()
+
+    def scan(path: str) -> None:
+        if not path or path in seen:
+            return
+        seen.add(path)
+        if not path.endswith((".m", ".mm", ".h", ".hpp", ".cpp", ".cc")):
+            return
+        try:
+            if os.path.getsize(path) > 2_000_000:
+                return
+            with open(path, "r", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            return
+        names.update(re.findall(r"@import\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", text))
+        names.update(re.findall(
+            r'#(?:import|include)\s*[<"]([A-Za-z_][A-Za-z0-9_]*)/'
+            r'[^">]*-Swift\.h[>"]',
+            text,
+        ))
+
+    # Pod headers are not part of a target's sources phase, but they are a
+    # common place for cross-module imports (for example the dev launcher
+    # imports EXUpdatesInterface-Swift.h from EXDevLauncherController.h).
+    headers = os.path.join(project.source_root, "Headers")
+    if os.path.isdir(headers):
+        for root, _directories, files in os.walk(headers):
+            for name in files:
+                scan(os.path.join(root, name))
+
+    for target in project.targets:
+        for reference in target.source_files():
+            scan(reference.absolute_path or reference.path)
+    return names
+
+
+SWIFT_INTEROP_INCLUDE = swiftenv.swift_include()
+
+
+def add_interop_includes(settings: dict[str, str], cxx_interop: bool = True) -> None:
+    """Make C++ interop usable by the targets that need it.
+
+    Pod headers may include `<swift/bridging>`, and modules that expose C++
+    declarations declare `requires cplusplus`. Xcode's toolchain handles both
+    implicitly; on Linux the include directory must be named, and Swift must be
+    in C++ interop mode before it will accept such modules.
+
+    Interop mode is not enabled for every target: mixed Objective-C/C++ modules
+    (React) only fail when the importer enters C++ mode, and targets that do
+    not import a C++ module must keep the Objective-C behaviour they have on
+    macOS.
+    """
+    swift_flags = settings.get("OTHER_SWIFT_FLAGS") or ""
+    if SWIFT_INTEROP_INCLUDE and SWIFT_INTEROP_INCLUDE not in swift_flags:
+        swift_flags = f"{swift_flags} -Xcc -I{SWIFT_INTEROP_INCLUDE}".strip()
+    if cxx_interop and "-cxx-interoperability-mode" not in swift_flags:
+        swift_flags = f"{swift_flags} -cxx-interoperability-mode=default".strip()
+    # The Swift Clang importer does not consume CLANG_CXX_LANGUAGE_STANDARD.
+    # In interop mode it defaults to C++17, while React's public headers use
+    # C++20 (`requires`, std::derived_from). Forward the target's standard to
+    # the importer so module builds use the same language level as the code
+    # they expose.
+    if "-cxx-interoperability-mode" in swift_flags:
+        standard = settings.get("CLANG_CXX_LANGUAGE_STANDARD") or "c++17"
+        if "-Xcc -std=" not in swift_flags:
+            swift_flags = f"{swift_flags} -Xcc -std={standard}".strip()
+    settings["OTHER_SWIFT_FLAGS"] = swift_flags
+
+    for key in ("OTHER_CFLAGS", "OTHER_CPLUSPLUSFLAGS"):
+        value = settings.get(key) or ""
+        if SWIFT_INTEROP_INCLUDE not in value:
+            settings[key] = f"{value} -I{SWIFT_INTEROP_INCLUDE}".strip()
+
+    # React's prebuilt module map marks unguarded headers as textual, and those
+    # headers use C++ declarations without importing their owning module. With
+    # open-source Clang that combination produces hard module-visibility errors
+    # ("missing '#include jsi/jsi.h'"). Swift Build drops `-Xclang`, so the
+    # per-target cc1 switch cannot be expressed; compile C++/ObjC++ textually
+    # instead. Swift targets keep modules for their Clang importer.
+    cxx_flags = settings.get("OTHER_CPLUSPLUSFLAGS") or ""
+    if "-fno-modules" not in cxx_flags:
+        settings["OTHER_CPLUSPLUSFLAGS"] = f"{cxx_flags} -fno-modules".strip()
+
+
+def merged_settings(target: xcodeproj.Target, configuration: str) -> dict[str, str]:
+    """Bake the target's xcconfig chain into one dictionary, Xcode-style.
+
+    Xcode hands Swift Build resolved settings, not xcconfig paths, so every
+    key is resolved through the layer stack (`$(inherited)` included).
+    """
+    stack = target.settings(configuration)
+    keys: list[str] = []
+    for layer in stack.layers:
+        for key in layer:
+            if key not in keys:
+                keys.append(key)
+    resolved = {key: stack.raw(key) for key in keys}
+
+    # CocoaPods writes $(PODS_CONFIGURATION_BUILD_DIR) into library and
+    # framework search paths. Xcode expands BUILD_DIR and
+    # EFFECTIVE_PLATFORM_NAME; Swift Build does not, so bake the real products
+    # directory into the PIF.
+    products = _BUILD_PRODUCTS_DIRS.get(configuration, "")
+    if products:
+        for key, value in list(resolved.items()):
+            if not isinstance(value, str):
+                continue
+            for prefix in (
+                f"${{BUILD_DIR}}/{configuration}$(EFFECTIVE_PLATFORM_NAME)",
+                f"$(BUILD_DIR)/{configuration}$(EFFECTIVE_PLATFORM_NAME)",
+            ):
+                value = value.replace(prefix, products)
+            resolved[key] = value
+
+    # `expo run:ios` chooses the dev-server port and exports it to xcodebuild.
+    # React Native's Info.plist expands `$(RCT_METRO_PORT)` into the default
+    # bundle URL; Swift Build gets settings explicitly, so the value has to be
+    # in the PIF or the app bakes an empty URL and falls back to 8081.
+    metro_port = os.environ.get("RCT_METRO_PORT")
+    if metro_port:
+        resolved["RCT_METRO_PORT"] = metro_port
+
+    # A pod whose own public headers are C++ needs Swift/C++ interop, the same
+    # way Xcode enables it per target.
+    public = os.path.join(target.project.source_root, "Headers", "Public", target.name)
+    if os.path.isdir(public):
+        for root, _dirs, files in os.walk(public):
+            if any(name.endswith((".hpp", ".hxx", ".hh")) for name in files):
+                resolved.setdefault("SWIFT_CPP_INTEROP_MODE", "default")
+                flags = resolved.get("OTHER_SWIFT_FLAGS", "")
+                if "cxx-interoperability-mode" not in flags:
+                    resolved["OTHER_SWIFT_FLAGS"] = (flags + " -cxx-interoperability-mode=default").strip()
+                break
+
+    # Explicit Swift modules build the C++ interop module without interop and
+    # import types as opaque references; implicit modules behave like Xcode's
+    # traditional path and keep the members visible.
+    resolved.setdefault("SWIFT_ENABLE_EXPLICIT_MODULES", "NO")
+    # CocoaPods' script phases write outside the sandbox (they generate the
+    # modules provider, copy frameworks and prune build products), so the
+    # Xcode 15+ script sandbox has to stay off.
+    resolved["ENABLE_USER_SCRIPT_SANDBOXING"] = "NO"
+    # The pipeline stays unsigned; xtool is the only signer, so CocoaPods'
+    # embed-framework phase must not try to re-sign anything.
+    resolved["CODE_SIGNING_ALLOWED"] = "NO"
+    resolved["CODE_SIGNING_REQUIRED"] = "NO"
+    resolved["CODE_SIGN_IDENTITY"] = ""
+    resolved["EXPANDED_CODE_SIGN_IDENTITY"] = ""
+    # The iOS runtime already carries Swift; embedding it is Apple-only and
+    # Swift Build's builtin stdlib copier cannot parse Mach-O on Linux.
+    resolved["ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES"] = "NO"
+    resolved["STRIP_BITCODE_FROM_COPIED_FILES"] = "NO"
+    resolved["DONT_RUN_SWIFT_STDLIB_TOOL"] = "YES"
+
+    # Swift Build only merges a target's generated Swift header into the
+    # products directory when the header has a name. The module map of a pod
+    # that defines a module references it there, so without this the module
+    # cannot be imported.
+    if str(resolved.get("DEFINES_MODULE", "")).upper() == "YES":
+        # Xcode names the generated Swift header `<Module>-Swift.h`; CocoaPods'
+        # copy phase then places it where the module map expects it (through
+        # `ditto`). Without the name Swift Build emits no header at all. The
+        # key can already be present with an empty value.
+        module = resolved.get("PRODUCT_MODULE_NAME") or target.name.replace("-", "_")
+        if not resolved.get("SWIFT_OBJC_INTERFACE_HEADER_NAME"):
+            resolved["SWIFT_OBJC_INTERFACE_HEADER_NAME"] = f"{module}-Swift.h"
+
+    # C++ interop macros (SWIFT_COMPUTED_PROPERTY and friends) come from
+    # swift/bridging in the host toolchain. Swift Build does not put that
+    # include on the Clang importer's path, so the properties silently vanish.
+    swift_flags = resolved.get("OTHER_SWIFT_FLAGS", "")
+    include = swiftenv.swift_include()
+    if include and f"-I{include}" not in swift_flags:
+        swift_flags = f"{swift_flags} -Xcc -I{include}".strip()
+    # Swift's importer builds modules in C++ mode under interop; React's
+    # textual headers then trigger local-submodule-visibility errors. The
+    # importer accepts the cc1 option directly through -Xcc.
+    if "-cxx-interoperability-mode" in swift_flags:
+        if "-Xcc -Xclang -Xcc -fno-modules-local-submodule-visibility" not in swift_flags:
+            swift_flags = (
+                f"{swift_flags} -Xcc -Xclang -Xcc -fno-modules-local-submodule-visibility"
+            ).strip()
+    resolved["OTHER_SWIFT_FLAGS"] = swift_flags
+
+    frameworks = resolved.get("FRAMEWORK_SEARCH_PATHS")
+    if frameworks:
+        resolved["FRAMEWORK_SEARCH_PATHS"] = staged_framework_paths(frameworks)
+        # A vendored xcframework may wrap a static library (Oniguruma ships
+        # libonig.a inside its framework); the linker needs that directory on
+        # the library search path for `-lonig`.
+        libraries = resolved.get("LIBRARY_SEARCH_PATHS", "")
+        for directory in staged_library_paths(frameworks):
+            if directory not in libraries:
+                libraries += f' "{directory}"'
+        resolved["LIBRARY_SEARCH_PATHS"] = libraries.strip()
+        # Sources that use quoted includes into an xcframework need the
+        # slice's Headers directory on the header search path.
+        headers = resolved.get("HEADER_SEARCH_PATHS", "")
+        for path in staged_header_paths(frameworks):
+            if path not in headers:
+                headers += f' "{path}"'
+        resolved["HEADER_SEARCH_PATHS"] = headers.strip()
+
+    # Xcode applies OTHER_CFLAGS to C++ translation units as well. Swift
+    # Build enforces the spec's file-type filtering (OTHER_CFLAGS is listed
+    # for C/ObjC, OTHER_CPLUSPLUSFLAGS for C++), so a pod that puts a required
+    # macro in OTHER_CFLAGS loses it in .cpp/.mm files. Mirror Xcode by
+    # carrying the C flags into the C++ flags unless they are already there.
+    cflags = resolved.get("OTHER_CFLAGS", "")
+    cxxflags = resolved.get("OTHER_CPLUSPLUSFLAGS", "")
+    if cflags and cflags not in cxxflags:
+        resolved["OTHER_CPLUSPLUSFLAGS"] = f"{cxxflags} {cflags}".strip()
+
+    # Xcode passes the target's header search paths to the Swift Clang
+    # importer. Swift Build does not always do that for prebuilt module maps,
+    # so forward every resolved directory explicitly. This is what makes
+    # headers referenced by frameworks (ReactCommon, RCTDeprecation, …)
+    # visible without naming any particular pod.
+    swift_flags = resolved.get("OTHER_SWIFT_FLAGS", "")
+    for directory in shlex.split(resolved.get("HEADER_SEARCH_PATHS", "")):
+        directory = directory.strip('"')
+        if not directory or not os.path.isdir(directory):
+            continue
+        flag = f"-Xcc -I{shlex.quote(directory)}"
+        if flag not in swift_flags:
+            swift_flags = f"{swift_flags} {flag}".strip()
+    resolved["OTHER_SWIFT_FLAGS"] = swift_flags
+
+    # Swift Build does not forward LIBRARY_SEARCH_PATHS to the linker for
+    # CocoaPods' static archives. Carry the resolved directories in the link
+    # flags as well; -l flags and the PIF target graph stay unchanged. The
+    # search paths go first so lld resolves the -l names.
+    links = resolved.get("OTHER_LDFLAGS", "")
+    link_dirs: list[str] = []
+    for directory in shlex.split(resolved.get("LIBRARY_SEARCH_PATHS", "")):
+        directory = directory.strip('"')
+        if not directory or "$(" in directory or "${" in directory:
+            continue
+        if not os.path.isdir(directory):
+            continue
+        flag = f"-L{directory}"
+        if flag not in link_dirs:
+            link_dirs.append(flag)
+    if link_dirs:
+        links = " ".join(link_dirs + [links]).strip()
+    resolved["OTHER_LDFLAGS"] = links
+
+    return resolved
+
+
+def linked_targets(settings: dict[str, str], targets_by_name: dict[str, str], self_id: str) -> list[str]:
+    """Map `-l<name>` link flags to PIF target GUIDs.
+
+    CocoaPods links pods by library name and never declares target
+    dependencies, so this is what makes Swift Build order them.
+    """
+    names: list[str] = []
+    tokens = settings.get("OTHER_LDFLAGS", "").split()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-framework" and index + 1 < len(tokens):
+            library = tokens[index + 1].strip('"')
+            index += 2
+        elif token.startswith("-l"):
+            library = token[2:].strip('"')
+            index += 1
+        else:
+            index += 1
+            continue
+        guid = targets_by_name.get(library)
+        if guid and guid != self_id and guid not in names:
+            names.append(guid)
+    return names
+
+
+def direct_archives(
+    settings: dict[str, str],
+    configuration: str,
+    static_libraries: dict[str, str],
+) -> None:
+    """Replace CocoaPods `-l<name>` with the built archive path.
+
+    Swift Build does not pass LIBRARY_SEARCH_PATHS to ld64.lld for these
+    static products, even when OTHER_LDFLAGS contains the resolved -L path.
+    The dependency graph is already built from the original -l flags, so the
+    final link settings can use the archive directly. The archive may not
+    exist yet on a clean build; the dependency graph builds it first.
+    """
+    links = settings.get("OTHER_LDFLAGS", "")
+    products = _BUILD_PRODUCTS_DIRS.get(configuration, "")
+    if not links or not products:
+        return
+    tokens: list[str] = []
+    for token in shlex.split(links):
+        if token.startswith("-l") and not token.startswith("-lto"):
+            name = token[2:].strip('"')
+            target = static_libraries.get(name)
+            if target:
+                tokens.append(os.path.join(products, target, f"lib{name}.a"))
+                continue
+            candidates = (
+                os.path.join(products, name, f"lib{name}.a"),
+                os.path.join(products, f"lib{name}.a"),
+            )
+            archive = next((path for path in candidates if os.path.isfile(path)), "")
+            if archive:
+                tokens.append(archive)
+                continue
+        tokens.append(token)
+    settings["OTHER_LDFLAGS"] = " ".join(shlex.quote(token) for token in tokens)
+
+
+def target_name_aliases(projects: list[xcodeproj.Project], configuration: str) -> dict[str, str]:
+    """Map target names and their linkable product/module names to GUIDs.
+
+    `-framework EXDevMenu` refers to the module product, while the pod target
+    is named `expo-dev-menu`. Without the alias the target never becomes a
+    dependency, so consumers can compile before the module's Swift header is
+    generated.
+    """
+    aliases: dict[str, str] = {}
+    for project in projects:
+        for target in project.targets:
+            aliases.setdefault(target.name, target.id)
+            if target.product_name:
+                aliases.setdefault(target.product_name, target.id)
+            try:
+                settings = merged_settings(target, configuration)
+            except Exception:
+                continue
+            for key in ("PRODUCT_NAME", "PRODUCT_MODULE_NAME"):
+                value = settings.get(key)
+                if value:
+                    aliases.setdefault(value, target.id)
+    return aliases
+
+
+def project_configurations(project: xcodeproj.Project) -> tuple[list[str], dict[str, list[dict]]]:
+    configuration_list = project.objects.get(project.root.get("buildConfigurationList", ""), {})
+    names: list[str] = []
+    configs: dict[str, list[dict]] = {}
+    for config_id in configuration_list.get("buildConfigurations", []):
+        obj = project.objects.get(config_id, {})
+        names.append(obj.get("name", ""))
+    for name in names:
+        stack = xcconfig.SettingsStack(project.layers(name))
+        keys: list[str] = []
+        for layer in stack.layers:
+            for key in layer:
+                if key not in keys:
+                    keys.append(key)
+        merged = {key: stack.raw(key) for key in keys}
+        add_interop_includes(merged)
+        configs[name] = [
+            piflib.build_configuration(f"{project.root_id}::{name}", name, merged)
+        ]
+    return names, configs
+
+
+def project_to_pif(
+    pif: piflib.Pif,
+    project: xcodeproj.Project,
+    targets_by_name: dict[str, str],
+    static_libraries: dict[str, str],
+) -> str:
+    configuration_names, project_configs = project_configurations(project)
+    default_configuration = configuration_names[0] if configuration_names else "Release"
+
+    # Targets that import an SPM-backed pod (one that ships a Swift package and
+    # a stub xcframework) need C++ interop; the rest must keep Objective-C
+    # module behaviour. Interop is propagated to dependents, because importing
+    # Interop is enabled by evidence of C++ exposure, not by build-system
+    # shape: `merged_settings` turns it on for pods whose public headers are
+    # `.hpp`. Having a `Package.swift` says nothing about C++ (Expo and
+    # safe-area-context ship SPM manifests but their Swift never sees C++
+    # types), and enabling it there makes their import of prebuilt
+    # ExpoModulesCore activate C++-only headers that are not part of the
+    # ObjC-mode module macOS consumers use.
+    interop_targets: set[str] = set()
+
+    target_signatures: list[str] = []
+    swift_consumers = swift_header_consumers(project)
+    targets_by_id = {candidate.id: candidate for candidate in project.targets}
+    swift_product_cache: dict[str, bool] = {}
+
+    def has_swift_product(target: xcodeproj.Target, seen: set[str] | None = None) -> bool:
+        """Whether this target or a target it packages contains Swift code.
+
+        Aggregate pods (for example expo-dev-launcher) have no Swift sources
+        themselves; the generated header is produced by their Swift target.
+        A dependency graph is required to tell them apart from truly
+        Objective-C-only pods.
+        """
+        if target.id in swift_product_cache:
+            return swift_product_cache[target.id]
+        seen = seen or set()
+        if target.id in seen:
+            return False
+        seen.add(target.id)
+        result = any(
+            (reference.absolute_path or reference.path).endswith(".swift")
+            for reference in target.source_files()
+        )
+        if not result:
+            result = any(
+                has_swift_product(targets_by_id[dependency], seen)
+                for dependency in target.dependency_ids
+                if dependency in targets_by_id
+            )
+        swift_product_cache[target.id] = result
+        return result
+
+    for target in project.targets:
+        base = merged_settings(target, default_configuration)
+        srcroot = base.get("PODS_TARGET_SRCROOT", "")
+        module = base.get("PRODUCT_MODULE_NAME") or target.name.replace("-", "_")
+        header_needed = has_swift_product(target) and (
+            imports_swift_header(srcroot, module) or module in swift_consumers
+            if srcroot else True
+        )
+        linked = linked_targets(base, targets_by_name, target.id)
+        dependency_guids = list(target.dependency_ids)
+        for guid in linked:
+            if guid not in dependency_guids:
+                dependency_guids.append(guid)
+        phases = []
+        for phase in target.build_phases:
+            script = phase.shell_script
+            # Pods that ship a Swift package and drive `xcodebuild` to produce
+            # a framework cannot run here; the engine builds that product
+            # before the build, so the phase only has to succeed.
+            if not header_needed and "compatibility header" in (phase.name or "").lower():
+                # Nothing imports this pod's Swift header; the phase would
+                # also append a `.Swift` submodule that nothing can build.
+                phase.shell_script = "exit 0\n"
+            if "react-native-xcode.sh" in script:
+                prefix = ""
+                hermesc = find_linux_hermesc(target.project.source_root)
+                if hermesc:
+                    prefix += f'export HERMES_CLI_PATH="{hermesc}"\n'
+                # `expo run:ios` decides whether JS is bundled by exporting
+                # these to xcodebuild; script phases only receive PATH, so the
+                # values are carried into the phase itself.
+                for key in (
+                    "SKIP_BUNDLING",
+                    "RCT_METRO_PORT",
+                    "RCT_TERMINAL",
+                    "__EXPO_EAGER_BUNDLE_OPTIONS",
+                    "NODE_BINARY",
+                ):
+                    value = os.environ.get(key)
+                    if value:
+                        prefix += f"export {key}={shlex.quote(value)}\n"
+                if prefix:
+                    phase.shell_script = prefix + script
+            if "expo-configure-project.sh" in script:
+                # This regenerates ExpoModulesProvider.swift. `pod install`
+                # already writes it, and the @ExpoModule scan it performs needs
+                # a macOS-only scanner binary, so the phase is a no-op here.
+                phase.shell_script = "exit 0\n"
+            if "build-xcframework.sh" in script and srcroot and os.path.isfile(
+                os.path.join(srcroot, "Package.swift")
+            ):
+                phase.shell_script = "exit 0\n"
+            build_files = [
+                piflib.build_file(f"{phase.id}::{index}", build_file.file_ref.id)
+                for index, build_file in enumerate(phase.files)
+                if build_file.file_ref
+            ]
+            phases.append(piflib.build_phase(phase, phase.id, build_files))
+
+        target_configs = []
+        for name in configuration_names or [default_configuration]:
+            settings = merged_settings(target, name)
+            add_interop_includes(settings, target.id in interop_targets)
+            replace_host_macros(settings)
+            direct_archives(settings, name, static_libraries)
+            if header_needed:
+                if not settings.get("SWIFT_OBJC_INTERFACE_HEADER_NAME"):
+                    settings["SWIFT_OBJC_INTERFACE_HEADER_NAME"] = f"{module}-Swift.h"
+            else:
+                settings["SWIFT_OBJC_INTERFACE_HEADER_NAME"] = ""
+            target_configs.append(
+                piflib.build_configuration(f"{target.id}::{name}", name, settings)
+            )
+
+        dependencies = dependency_guids
+        # CocoaPods aggregates every pod into `Pods-<App>`; the app must depend
+        # on it or none of the pod targets (and their script phases) are built.
+        umbrella = targets_by_name.get(f"Pods-{target.name}")
+        if umbrella and umbrella != target.id and umbrella not in dependencies:
+            dependencies.append(umbrella)
+
+        if target.isa == "PBXAggregateTarget" or not target.product_type:
+            target_signatures.append(
+                pif.aggregate_target(
+                    guid=target.id,
+                    name=target.name,
+                    build_configurations=target_configs,
+                    build_phases=phases,
+                    dependencies=dependencies,
+                )
+            )
+        else:
+            target_signatures.append(
+                pif.target(
+                    guid=target.id,
+                    name=target.name,
+                    product_name=target.product_name or target.name,
+                    product_type=target.product_type,
+                    product_reference_guid=f"PRODUCTREF-{target.id}",
+                    build_configurations=target_configs,
+                    build_phases=phases,
+                    dependencies=dependencies,
+                )
+            )
+
+    all_project_configs = [config for configs in project_configs.values() for config in configs]
+    return pif.project(
+        guid=project.root_id,
+        name=os.path.basename(os.path.dirname(project.path)),
+        project_path=project.path,
+        project_dir=project.source_root,
+        group_tree=project.group_tree(),
+        build_configurations=all_project_configs,
+        targets=target_signatures,
+        default_configuration=default_configuration,
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("output")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("-workspace", dest="workspace")
+    group.add_argument("-project", dest="project")
+    parser.add_argument("--configuration", default="")
+    args = parser.parse_args()
+
+    global _BUILD_PRODUCTS_DIRS
+    derived = os.path.dirname(os.path.abspath(args.output))
+    _BUILD_PRODUCTS_DIRS = {
+        name: os.path.join(derived, "Build", "Products", name + "-iphoneos")
+        for name in ("Debug", "Release")
+    }
+
+    if args.workspace:
+        workspace = xcodeproj.Workspace(args.workspace)
+        project_paths = workspace.project_paths
+        workspace_path = workspace.path
+        workspace_name = os.path.basename(os.path.dirname(workspace_path))
+    else:
+        project_paths = [args.project]
+        workspace_path = os.path.join(
+            os.path.dirname(os.path.abspath(args.project)),
+            os.path.basename(args.project).replace(".xcodeproj", ".xcworkspace"),
+        )
+        workspace_name = os.path.basename(workspace_path)
+
+    if not project_paths:
+        print("error: no projects found", file=sys.stderr)
+        return 1
+
+    projects = [xcodeproj.Project(path) for path in project_paths]
+    targets_by_name = target_name_aliases(projects, args.configuration or "Release")
+    target_names = {
+        target.id: target.name for project in projects for target in project.targets
+    }
+    static_ids = {
+        target.id
+        for project in projects
+        for target in project.targets
+        if target.is_static_library
+    }
+    static_libraries = {
+        alias: target_names[guid]
+        for alias, guid in targets_by_name.items()
+        if guid in static_ids
+    }
+
+    document = piflib.Pif()
+    project_signatures = [
+        project_to_pif(document, project, targets_by_name, static_libraries)
+        for project in projects
+    ]
+    document.workspace(
+        guid="WORKSPACE",
+        name=workspace_name,
+        path=workspace_path,
+        projects=project_signatures,
+    )
+    # Swift Build requires the workspace to be the first object in the array.
+    document.objects.insert(0, document.objects.pop())
+
+    with open(args.output, "w", encoding="utf-8") as handle:
+        handle.write(document.dumps())
+    print(f"wrote {args.output} ({len(document.objects)} PIF objects)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

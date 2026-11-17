@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Add the iPad orientation set that Docker's pod2ninja.py wrote.
+
+Docker read expo.ios.supportsTablet from app.json and, when true, added
+UISupportedInterfaceOrientations~ipad with all four iPad orientations to the
+built Info.plist. Swift Build has no equivalent, so the native build kept the
+portrait-only key and the iPad rendered the app in a sideways window.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import plistlib
+import sys
+
+IPAD_ORIENTATIONS = [
+    "UIInterfaceOrientationPortrait",
+    "UIInterfaceOrientationPortraitUpsideDown",
+    "UIInterfaceOrientationLandscapeLeft",
+    "UIInterfaceOrientationLandscapeRight",
+]
+
+
+def configuration_from(derived: str) -> tuple[str, str]:
+    parameters = os.path.join(derived, "build-parameters.json")
+    configuration, platform = "Release", "iphoneos"
+    try:
+        with open(parameters, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return configuration, platform
+    configuration = data.get("configurationName") or configuration
+    destination = data.get("activeRunDestination") or {}
+    platform = destination.get("platform") or platform
+    return configuration, platform
+
+
+def find_app(derived: str) -> str | None:
+    configuration, platform = configuration_from(derived)
+    products = os.path.join(derived, "Build", "Products", f"{configuration}-{platform}")
+    if not os.path.isdir(products):
+        return None
+    apps = [
+        os.path.join(products, entry)
+        for entry in sorted(os.listdir(products))
+        if entry.endswith(".app")
+    ]
+    return apps[0] if apps else None
+
+
+def supports_tablet(app_root: str) -> bool:
+    path = os.path.join(app_root, "app.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(config.get("expo", {}).get("ios", {}).get("supportsTablet", False))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--derived", required=True, help="DerivedData directory")
+    parser.add_argument("--app-root", required=True, help="Expo project root")
+    args = parser.parse_args()
+
+    if not supports_tablet(args.app_root):
+        return 0
+
+    app = find_app(args.derived)
+    if not app:
+        print("patch-ipad-orientations: no app bundle found", file=sys.stderr)
+        return 1
+
+    plist_path = os.path.join(app, "Info.plist")
+    try:
+        with open(plist_path, "rb") as handle:
+            info = plistlib.load(handle)
+    except (OSError, plistlib.InvalidFileException) as exc:
+        print(f"patch-ipad-orientations: {plist_path}: {exc}", file=sys.stderr)
+        return 1
+
+    if info.get("UISupportedInterfaceOrientations~ipad") == IPAD_ORIENTATIONS:
+        return 0
+
+    info["UISupportedInterfaceOrientations~ipad"] = IPAD_ORIENTATIONS
+    with open(plist_path, "wb") as handle:
+        plistlib.dump(info, handle)
+    print(f"patched iPad orientations: {plist_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

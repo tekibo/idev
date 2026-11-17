@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Full audit of the `expo run:ios` execution graph on Linux.
+
+Enumerates every external command the Expo CLI reaches (build, device, Metro),
+every platform gate in the CLI, and every binary the Xcode build phases call,
+then classifies each as available, missing, or device-only.
+
+    audit-expo-flow <project dir>
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import os
+import re
+import shutil
+import sys
+
+COMMAND_PATTERNS = [
+    r"spawn\(\s*'([^']+)'",
+    r"spawnAsync\(\s*'([^']+)'",
+    r"execSync\(\s*'([^' ]+)",
+    r"execFileSync\(\s*'([^']+)'",
+    r"execa\(\s*'([^']+)'",
+]
+
+INTERESTING = {
+    "xcodebuild", "xcrun", "pod", "node", "npx", "npm", "yarn", "pnpm",
+    "ruby", "gem", "git", "open", "osascript", "plutil", "ditto", "lipo",
+    "codesign", "security", "simctl", "devicectl", "ios-deploy", "ideviceinstaller",
+    "emulator", "adb", "watchman", "rg", "swift", "clang", "actool", "ibtool",
+}
+
+
+def cli_source(project: str) -> str | None:
+    candidates = []
+    candidates += glob.glob(os.path.join(project, "node_modules", "@expo", "cli", "build", "src"))
+    candidates += glob.glob(os.path.join(project, "**", ".pnpm", "@expo+cli@*", "node_modules", "@expo", "cli", "build", "src"), recursive=True)
+    candidates += glob.glob(os.path.join(project, "..", "..", "node_modules", ".pnpm", "@expo+cli@*", "node_modules", "@expo", "cli", "build", "src"))
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def scan_commands(root: str) -> dict[str, list[str]]:
+    found: dict[str, set[str]] = {}
+    for path in glob.glob(os.path.join(root, "**", "*.js"), recursive=True):
+        if path.endswith(".map"):
+            continue
+        try:
+            text = open(path, "r", errors="replace").read()
+        except OSError:
+            continue
+        for command in INTERESTING:
+            if re.search(r"[\"'`]" + re.escape(command) + r"[\"'`]", text):
+                rel = os.path.relpath(path, root)
+                found.setdefault(command, set()).add(rel)
+    return {key: sorted(value) for key, value in found.items()}
+
+
+def scan_gates(root: str) -> list[tuple[str, int, str]]:
+    gates = []
+    for path in glob.glob(os.path.join(root, "**", "*.js"), recursive=True):
+        if path.endswith(".map"):
+            continue
+        try:
+            lines = open(path, "r", errors="replace").read().splitlines()
+        except OSError:
+            continue
+        for number, line in enumerate(lines, 1):
+            if "process.platform" in line and "darwin" in line:
+                gates.append((os.path.relpath(path, root), number, line.strip()[:150]))
+    return gates
+
+
+def scan_build_phases(ios_dir: str) -> dict[str, int]:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from lib import xcodeproj
+
+    binaries: dict[str, int] = {}
+    projects = sorted(glob.glob(os.path.join(ios_dir, "*.xcodeproj")))
+    pods_project = os.path.join(ios_dir, "Pods", "Pods.xcodeproj")
+    if os.path.isdir(pods_project):
+        projects.append(pods_project)
+    for path in projects:
+        if not os.path.isdir(path):
+            continue
+        parsed = xcodeproj.Project(path)
+        for target in parsed.targets:
+            for phase in target.script_phases():
+                for line in (phase.shell_script or "").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    match = re.match(r"([A-Za-z_][A-Za-z0-9_.+-]*)\b", line)
+                    if not match:
+                        continue
+                    name = match.group(1)
+                    if not re.fullmatch(r"[a-z][a-z0-9_.+-]*", name):
+                        continue
+                    if name in ("if", "then", "else", "fi", "for", "do", "done",
+                                "case", "esac", "export", "set", "cd", "echo",
+                                "exit", "local", "return", "source", "eval",
+                                "popd", "pushd", "shift", "read", "true", "false",
+                                "while", "until", "function", "unset", "test",
+                                "wait", "trap", "printf", "mkdir", "rm", "cp",
+                                "mv", "cat", "grep", "sed", "awk", "find", "touch"):
+                        continue
+                    binaries[name] = binaries.get(name, 0) + 1
+    return binaries
+
+
+def main() -> int:
+    project = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
+    ios_dir = os.path.join(project, "ios")
+    source = cli_source(project)
+
+    report: list[str] = ["# Expo flow audit", ""]
+
+    report.append("## Commands the Expo CLI spawns")
+    report.append("")
+    report.append("| command | availability | used by |")
+    report.append("|---|---|---|")
+    if source:
+        for command, files in sorted(scan_commands(source).items()):
+            available = "found" if shutil.which(command) else "MISSING"
+            report.append(
+                f"| `{command}` | {available} | {', '.join(files[:3])} |"
+            )
+    report.append("")
+
+    report.append("## Platform gates")
+    report.append("")
+    report.append("| file | line | code |")
+    report.append("|---|---|---|")
+    if source:
+        for path, line, text in scan_gates(source):
+            report.append(f"| {path} | {line} | `{text}` |")
+    report.append("")
+
+    report.append("## Binaries invoked by Xcode build phases")
+    report.append("")
+    report.append("| binary | phases | availability |")
+    report.append("|---|---|---|")
+    for name, count in sorted(scan_build_phases(ios_dir).items()):
+        available = "found" if shutil.which(name) else "MISSING"
+        report.append(f"| `{name}` | {count} | {available} |")
+    report.append("")
+
+    report.append("## Build output contract")
+    report.append("")
+    report.append("The CLI reads these from `xcodebuild` stdout:")
+    report.append("")
+    report.append("- `export CONFIGURATION_BUILD_DIR=<products dir>`")
+    report.append("- `export UNLOCALIZED_RESOURCES_FOLDER_PATH=<App>.app`")
+    report.append("")
+    report.append("Without them it falls back to a path matching")
+    report.append("`/Developer/Xcode/DerivedData/.../Build/Products/<Config>-<platform>/<App>.app`.")
+    report.append("")
+
+    output = os.environ.get("AUDIT_OUTPUT", "/tmp/expo-audit.md")
+    with open(output, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(report) + "\n")
+    print(output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

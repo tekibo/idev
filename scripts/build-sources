@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Fetch the pinned xtool and Swift Build sources into release archives.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="${1:?usage: build-sources OUT CACHE}"
+CACHE="${2:?usage: build-sources OUT CACHE}"
+LOCK="$ROOT/internal/platform/config/sources.lock"
+
+XTOOL_REPO=$(jq -r '.apple_dev.xtool_repo' "$LOCK")
+XTOOL_SHA=$(jq -r '.apple_dev.xtool_sha' "$LOCK")
+SB_REPO=$(jq -r '.idev.swift_build.repo' "$LOCK")
+SB_SHA=$(jq -r '.idev.swift_build.sha' "$LOCK")
+
+fetch() {
+    local repo="$1" sha="$2" dir="$3" prefix="$4" out="$5"
+    if [ ! -d "$dir/.git" ]; then
+        rm -rf "$dir"
+        mkdir -p "$dir"
+        git -C "$dir" init -q
+        git -C "$dir" fetch -q --depth 1 "$repo" "$sha"
+        git -C "$dir" checkout -q FETCH_HEAD
+    fi
+    git -C "$dir" archive --format=tar.gz --prefix="$prefix/" -o "$out" HEAD
+}
+
+fetch "$XTOOL_REPO" "$XTOOL_SHA" "$CACHE/xtool-$XTOOL_SHA" "xtool-$XTOOL_SHA" \
+    "$OUT/xtool-source-$XTOOL_SHA.tar.gz"
+fetch "$SB_REPO" "$SB_SHA" "$CACHE/swift-build-$SB_SHA" "swift-build-$SB_SHA" \
+    "$OUT/swift-build-source-$SB_SHA.tar.gz"

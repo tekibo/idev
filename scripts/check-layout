@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Enforce the repository layout.
+set -u
+
+MODE="${1:-strict}"
+failed=0
+violations=0
+
+report() {
+    echo "layout: $*"
+    violations=$((violations + 1))
+    if [ "$MODE" != "--report" ]; then
+        failed=1
+    fi
+}
+
+check_dirs() {
+    local parent="$1"
+    shift
+    local path name
+    for path in "$parent"/*; do
+        [ -d "$path" ] || continue
+        name=$(basename "$path")
+        case " $* " in
+            *" $name "*) ;;
+            *) report "unexpected directory $path" ;;
+        esac
+    done
+}
+
+require_dirs() {
+    local path
+    for path in "$@"; do
+        [ -d "$path" ] || report "missing directory $path"
+    done
+}
+
+check_dirs internal cli manager platform tools
+check_dirs internal/manager agents auth components core devices doctor next project setup uninstall update xcode
+check_dirs internal/cli help
+check_dirs internal/platform config download execx manifest project redact release security system terminal
+check_dirs internal/platform/security changeset privileged
+check_dirs internal/tools device flutter installers reactnative xtool
+check_dirs internal/tools/installers cocoapods darwin installutil official pymobile swift swiftbuild xtool
+check_dirs payloads react-native apple-tools flutter kmp
+require_dirs internal/cli/help payloads/react-native
+
+[ -e gui ] && report "obsolete gui directory"
+[ -e mygo.json ] && report "obsolete mygo.json"
+
+if [ "$MODE" = "--report" ]; then
+    echo "layout: report mode; $violations pending moves"
+    exit 0
+fi
+
+[ "$failed" -eq 0 ]

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# osascript shim for i-dev transparent macOS compatibility
+# Intercepts AppleScript queries from @expo/osascript and Apple tooling
+
+script="$*"
+
+if echo "$script" | grep -qi 'id of app "Simulator"'; then
+    echo "com.apple.iphonesimulator"
+    exit 0
+fi
+
+if echo "$script" | grep -qi 'id of app "DeviceHub"'; then
+    echo "com.apple.dt.Devices"
+    exit 0
+fi
+
+if echo "$script" | grep -qi 'count processes whose name is'; then
+    echo "0"
+    exit 0
+fi
+
+exit 0

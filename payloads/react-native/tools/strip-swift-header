@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Remove the recursive Optional bridging definitions from a generated header.
+
+Swift 6.4.x emits inline C++ definitions for Optional<T>'s
+_forceBridgeFromObjectiveCResult and _conditionallyBridgeFromObjectiveCResult.
+Their signatures take Optional<Optional<T>>, and completing that type
+instantiates the same helper again, so Clang recurses without a base case.
+The helpers only force-bridge an Objective-C id into Optional<T> from
+C++/ObjC++. Remove the inline definitions; the declarations stay.
+"""
+
+from __future__ import annotations
+
+import sys
+
+NAMES = (
+    "_forceBridgeFromObjectiveCResult",
+    "_conditionallyBridgeFromObjectiveCResult",
+)
+
+
+def strip(path: str) -> None:
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        lines = handle.readlines()
+
+    changed = False
+    for name in NAMES:
+        while True:
+            index = next(
+                (i for i, line in enumerate(lines) if f"Optional<T_0_0>::{name}(" in line),
+                None,
+            )
+            if index is None:
+                break
+            start = index
+            for j in range(index, max(-1, index - 8), -1):
+                if lines[j].strip() == "#if defined(__OBJC__)":
+                    start = j
+                    break
+            depth = 0
+            seen = False
+            end = index
+            for k in range(index, len(lines)):
+                for char in lines[k]:
+                    if char == "{":
+                        depth += 1
+                        seen = True
+                    elif char == "}":
+                        depth -= 1
+                if seen and depth == 0:
+                    end = k
+                    break
+            if not seen or depth != 0:
+                break
+            if end + 1 < len(lines) and lines[end + 1].strip() == "#endif // defined(__OBJC__)":
+                end += 1
+            del lines[start:end + 1]
+            changed = True
+
+    if changed:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.writelines(lines)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: strip-swift-header <header>")
+    strip(sys.argv[1])

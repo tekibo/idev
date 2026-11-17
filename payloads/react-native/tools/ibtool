@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""`ibtool` with the device ids Expo/React Native projects actually contain.
+
+The Apple tooling ibtool is the compiler; we do not fork it. It simply does
+not know every device id yet: React Native's template (and Expo's) writes
+`<device id="retina6_12">` for a 6.1" iPhone, which upstream reports as
+`device ... unsupported`.
+
+This wrapper loads their module, extends the size table, and runs their `main`.
+Upstream fix to send: add the entries in `EXTRA_DEVICES` to `DEVICE_SIZES`.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import sys
+
+import swiftenv
+
+# Logical size each id represents; matches the pattern of the existing table.
+EXTRA_DEVICES = {
+    "retina6_12": (393, 852),   # iPhone 15/15 Pro/16
+    "retina6_7": (428, 926),    # iPhone 12/13/14 Pro Max
+    "retina6_9": (440, 956),    # iPhone 16 Pro Max
+}
+
+OMARCHY_CANDIDATES = (
+    swiftenv.apple_tools_root(),
+    os.environ.get("I_DEV_APPLE_TOOLS", ""),
+)
+
+
+def apple_tools_ibtool() -> str:
+    for root in OMARCHY_CANDIDATES:
+        if not root:
+            continue
+        candidate = os.path.join(root, "tools", "ibtool")
+        if os.path.isfile(candidate):
+            return candidate
+    raise SystemExit("error: private Apple tooling ibtool not found; set IDEV_APPLE_TOOLS")
+
+
+def load_tool(path: str):
+    """Import one of the Apple tooling scripts without running its CLI.
+
+    The tools have no `.py` suffix, so the default loader lookup finds nothing
+    and the source loader has to be selected explicitly.
+    """
+    from importlib.machinery import SourceFileLoader
+
+    name = f"i_dev_{os.path.basename(path)}"
+    loader = SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    if spec is None:
+        raise SystemExit(f"error: cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def main() -> int:
+    tool = load_tool(apple_tools_ibtool())
+    table = getattr(tool, "DEVICE_SIZES")
+    for name, size in EXTRA_DEVICES.items():
+        table.setdefault(name, size)
+    return tool.main(sys.argv[1:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

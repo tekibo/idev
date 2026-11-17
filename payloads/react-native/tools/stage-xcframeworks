@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""Stage CocoaPods `.xcframework` device slices before the build.
+
+CocoaPods copies each vendored xcframework's platform slice into
+`$(PODS_XCFRAMEWORKS_BUILD_DIR)` from a generated script phase. Swift Build
+will not run that script before the compiles that need the framework, so the
+same copy is performed up front from the generated file lists.
+
+    stage-xcframeworks --ios-dir <ios> --parameters <build-parameters.json>
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+SLICES = ("ios-arm64", "iphoneos-arm64", "ios-arm64_x86_64-simulator")
+
+
+def expand(value: str, env: dict[str, str]) -> str:
+    for key, replacement in env.items():
+        value = value.replace("${%s}" % key, replacement)
+    return value
+
+
+def read_list(path: str) -> list[str]:
+    if not os.path.isfile(path):
+        return []
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        return [line.strip() for line in handle if line.strip()]
+
+
+MACHO_MAGICS = {
+    b"\xcf\xfa\xed\xfe",  # 64-bit little endian
+    b"\xce\xfa\xed\xfe",  # 32-bit little endian
+    b"\xfe\xed\xfa\xcf",  # 64-bit big endian
+    b"\xfe\xed\xfa\xce",  # 32-bit big endian
+    b"\xca\xfe\xba\xbe",  # fat, big endian
+    b"\xbe\xba\xfe\xca",  # fat, little endian
+}
+
+
+def is_macho(path: str) -> bool:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(4) in MACHO_MAGICS
+    except OSError:
+        return False
+
+
+def has_swift_module(framework: str, product: str, package: str) -> bool:
+    """True when the framework carries the Swift module its package defines.
+
+    A Mach-O binary alone is not a complete framework: Swift consumers need the
+    `.swiftmodule` beside it. Prebuilt or partially assembled frameworks can
+    have the binary and headers but no module, and then every `import` fails.
+    """
+    sources = os.path.join(package, "Sources", product)
+    if not os.path.isdir(sources):
+        return True
+    if not any(name.endswith(".swift")
+               for _root, _dirs, files in os.walk(sources) for name in files):
+        return True
+    modules = os.path.join(framework, "Modules", f"{product}.swiftmodule")
+    return os.path.isdir(modules) and any(
+        name.endswith((".swiftmodule", ".swiftinterface"))
+        for name in os.listdir(modules)
+    )
+
+
+def ensure_prebuilt(framework: str, pods_root: str, developer_dir: str,
+                    scratch_root: str = "") -> None:
+    """Build an SPM-backed xcframework when no complete build is present.
+
+    Some pods (expo-modules-jsi) ship `apple/Package.swift` plus an
+    xcodebuild-driven script and a stub xcframework. The stub still contains
+    `Modules/`, so its presence proves nothing: the binary is an `ar` archive
+    and prebuilt pods that link the framework dynamically fail at launch. Build
+    the package whenever the slice's binary is not Mach-O, or when it is Mach-O
+    but the Swift module is missing.
+    """
+    product = os.path.basename(framework)[: -len(".xcframework")]
+    slice_dir = os.path.join(framework, "ios-arm64")
+    built = os.path.join(slice_dir, f"{product}.framework")
+    binary = os.path.join(built, product)
+    tool = os.environ.get("IDEV_BUILD_PREBUILD_FRAMEWORK") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "build-prebuild-framework"
+    )
+    package = os.path.dirname(os.path.dirname(framework))
+    if is_macho(binary) and has_swift_module(built, product, package):
+        # The framework is already built; still refresh the Clang module
+        # definitions consumers resolve by name.
+        if os.path.isfile(tool) and os.path.isfile(os.path.join(package, "Package.swift")):
+            subprocess.run(
+                [sys.executable, tool, "--package", package, "--product", product,
+                 "--pods-root", pods_root, "--output", built, "--publish-only"],
+                check=False,
+            )
+        return
+    if not os.path.isfile(os.path.join(package, "Package.swift")):
+        return
+    if not os.path.isfile(tool):
+        print(f"warning: {tool} missing; cannot build {product}", file=sys.stderr)
+        return
+    print(f"building prebuilt pod {product}")
+    command = [
+        sys.executable, tool, "--package", package, "--product", product,
+        "--pods-root", pods_root, "--output", built,
+        "--developer-dir", developer_dir,
+    ]
+    if scratch_root:
+        command += ["--scratch", os.path.join(scratch_root, product)]
+    subprocess.run(command, check=False)
+    if not is_macho(binary):
+        print(
+            f"warning: {product} was built but its framework binary is not Mach-O",
+            file=sys.stderr,
+        )
+
+
+def append_swift_submodule(modulemap: str, module: str, header: str) -> None:
+    """Expose a Swift compatibility header through a staged Clang module."""
+    import re
+
+    try:
+        with open(modulemap, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return
+    if f"module {module}.Swift" in text:
+        pattern = re.compile(
+            rf'(module\s+{re.escape(module)}\.Swift\s*\{{[^}}]*?header\s+)"[^"]*"',
+            re.S,
+        )
+        updated = pattern.sub(rf'\1"{header}"', text, count=1)
+        if updated != text:
+            try:
+                with open(modulemap, "w", encoding="utf-8") as handle:
+                    handle.write(updated)
+            except OSError:
+                pass
+        return
+    try:
+        with open(modulemap, "a", encoding="utf-8") as handle:
+            handle.write(
+                f'\nmodule {module}.Swift {{\n'
+                f'  header "{header}"\n'
+                f'  requires objc\n'
+                f'}}\n'
+            )
+    except OSError:
+        pass
+
+
+def prepend_imports(header: str, imports: list[str]) -> bool:
+    """Put Swift dependency imports at the top of a staged umbrella header."""
+    try:
+        with open(header, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return False
+    missing = [line for line in imports if line not in text]
+    if not missing:
+        return False
+    try:
+        with open(header, "w", encoding="utf-8") as handle:
+            handle.write(
+                "// i-dev: expose Swift dependency interfaces before the "
+                "generated *-Swift.h submodule\n#ifdef __OBJC__\n"
+            )
+            for line in missing:
+                handle.write(line + "\n")
+            handle.write("#endif\n")
+            handle.write(text)
+    except OSError:
+        return False
+    return True
+
+
+def stage_umbrella_imports(
+    ios_dir: str,
+    configuration: str,
+    products: str,
+    swift_headers: dict[str, str],
+    dependencies: dict[str, list[str]],
+) -> int:
+    """Stage Swift dependency imports in consumer umbrella headers.
+
+    A module map parses its umbrella header before the `.Swift` submodule that
+    contains the generated *-Swift.h. If that generated header references a
+    protocol from another Swift module, importing the dependency at the
+    umbrella level makes the module itself build, not just its .m sources.
+    """
+    support = os.path.join(ios_dir, "Pods", "Target Support Files")
+    if not os.path.isdir(support):
+        return 0
+    destination_root = os.path.join(products, f"{configuration}-iphoneos")
+    updated = 0
+
+    for target, target_dependencies in dependencies.items():
+        imports: list[str] = []
+        for dependency in target_dependencies:
+            header = swift_headers.get(dependency)
+            if not header:
+                continue
+            header_path = os.path.join(
+                destination_root, dependency, "Swift Compatibility Header", header
+            )
+            if os.path.isfile(header_path):
+                imports.append(f'#import "{header_path}"')
+        if not imports:
+            continue
+
+        support_dir = os.path.join(support, target)
+        if not os.path.isdir(support_dir):
+            continue
+        umbrellas = [
+            name for name in sorted(os.listdir(support_dir))
+            if name.endswith("-umbrella.h")
+        ]
+        if not umbrellas:
+            continue
+
+        destinations = {os.path.join(destination_root, target)}
+        for name in sorted(os.listdir(support_dir)):
+            if not name.endswith(".modulemap"):
+                continue
+            module = declared_module_name(os.path.join(support_dir, name))
+            if module and module != target:
+                destinations.add(os.path.join(destination_root, module))
+
+        changed = False
+        for destination in destinations:
+            for umbrella in umbrellas:
+                path = os.path.join(destination, umbrella)
+                if os.path.isfile(path) and prepend_imports(path, imports):
+                    changed = True
+        if changed:
+            updated += 1
+
+    if updated:
+        print(f"updated {updated} umbrella headers")
+    return updated
+
+
+def stage_modulemaps(
+    ios_dir: str,
+    configuration: str,
+    products: str,
+    swift_headers: dict[str, str] | None = None,
+    dependencies: dict[str, list[str]] | None = None,
+) -> int:
+    """Copy each pod's module map and umbrella header into the products dir.
+
+    Two names matter here and they are not always the same: CocoaPods names the
+    pod (and the directory importers reference) after the package, while the
+    module map declares the module name. `expo-dev-menu-interface` is the pod,
+    `EXDevMenuInterface` is the module. Stage under both names, and also alias
+    the module map under its declared module name.
+
+    Swift-only pods have no Headers/Public directory; their module map and
+    umbrella live in Target Support Files. They also need a `.Swift` submodule
+    pointing at the compatibility header, which Xcode's copy phase would add
+    to the build product.
+    """
+    pods = os.path.join(ios_dir, "Pods")
+    public = os.path.join(pods, "Headers", "Public")
+    support = os.path.join(pods, "Target Support Files")
+    if not os.path.isdir(public) and not os.path.isdir(support):
+        return 0
+
+    swift_headers = swift_headers or {}
+    module_to_pod: dict[str, str] = {}
+    if os.path.isdir(support):
+        for pod in sorted(os.listdir(support)):
+            directory = os.path.join(support, pod)
+            if not os.path.isdir(directory):
+                continue
+            for name in sorted(os.listdir(directory)):
+                if not name.endswith(".modulemap"):
+                    continue
+                module = declared_module_name(os.path.join(directory, name))
+                if module:
+                    module_to_pod[module] = pod
+
+    destination_root = os.path.join(products, f"{configuration}-iphoneos")
+    copied = 0
+
+    def write_if_changed(path: str, content: str) -> None:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                if handle.read() == content:
+                    return
+        except OSError:
+            pass
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(content)
+        except OSError:
+            pass
+
+    def stage(
+        source_dir: str,
+        names: list[str],
+        destinations: set[str],
+        pod_name: str,
+    ) -> None:
+        nonlocal copied
+        for destination in destinations:
+            os.makedirs(destination, exist_ok=True)
+
+        header_name = swift_headers.get(pod_name)
+        module = ""
+        compatibility_header = ""
+        if header_name:
+            module = (
+                header_name[: -len("-Swift.h")]
+                if header_name.endswith("-Swift.h")
+                else pod_name
+            )
+            compatibility_header = os.path.join(
+                destination_root, "Swift Compatibility Header", header_name
+            )
+            os.makedirs(os.path.dirname(compatibility_header), exist_ok=True)
+
+            if not os.path.isfile(compatibility_header):
+                try:
+                    with open(compatibility_header, "w", encoding="utf-8") as handle:
+                        handle.write("// generated at build time\n")
+                except OSError:
+                    pass
+
+            # Consumers use both `#import "Module-Swift.h"` (with a per-pod
+            # Swift Compatibility Header search path) and
+            # `<Module/Module-Swift.h>`. Point both at the header the copy
+            # phase overwrites, so they see the real generated interface.
+            for destination in destinations:
+                for directory, name in (
+                    (os.path.join(destination, "Swift Compatibility Header"), header_name),
+                    (destination, header_name),
+                ):
+                    os.makedirs(directory, exist_ok=True)
+                    link = os.path.join(directory, name)
+                    if os.path.exists(link):
+                        continue
+                    try:
+                        os.symlink(compatibility_header, link)
+                    except OSError:
+                        pass
+
+        modulemaps: dict[str, str] = {}
+        for name in names:
+            source = os.path.join(source_dir, name)
+            if os.path.islink(source):
+                source = os.path.realpath(source)
+            target_names = {name}
+            if name.endswith(".modulemap"):
+                map_module = declared_module_name(source)
+                if map_module:
+                    target_names.add(f"{map_module}.modulemap")
+            for destination in destinations:
+                for target_name in target_names:
+                    target = os.path.join(destination, target_name)
+                    if not os.path.isfile(target):
+                        try:
+                            shutil.copy2(source, target)
+                            copied += 1
+                        except OSError:
+                            continue
+                    if target_name.endswith(".modulemap"):
+                        if header_name:
+                            modulemaps[target] = compatibility_header
+                        _ensure_swift_headers(target)
+            if name.endswith(".modulemap"):
+                _ensure_swift_headers(source)
+
+        for modulemap, submodule_header in modulemaps.items():
+            append_swift_submodule(modulemap, module, submodule_header)
+
+    if os.path.isdir(public):
+        for public_name in sorted(os.listdir(public)):
+            directory = os.path.join(public, public_name)
+            if not os.path.isdir(directory):
+                continue
+            names = [
+                name for name in sorted(os.listdir(directory))
+                if name.endswith(".modulemap") or name.endswith("-umbrella.h")
+            ]
+            if not names:
+                continue
+            pod_name = module_to_pod.get(public_name, public_name)
+            destinations = {os.path.join(destination_root, public_name)}
+            if pod_name != public_name:
+                destinations.add(os.path.join(destination_root, pod_name))
+            stage(directory, names, destinations, pod_name)
+
+    if os.path.isdir(support):
+        for pod_name in sorted(os.listdir(support)):
+            directory = os.path.join(support, pod_name)
+            if not os.path.isdir(directory):
+                continue
+            names = [
+                name for name in sorted(os.listdir(directory))
+                if name.endswith(".modulemap") or name.endswith("-umbrella.h")
+            ]
+            if not names:
+                continue
+            module_names = [
+                declared_module_name(os.path.join(directory, name))
+                for name in names if name.endswith(".modulemap")
+            ]
+            destinations = {os.path.join(destination_root, pod_name)}
+            destinations.update(
+                os.path.join(destination_root, module)
+                for module in module_names if module and module != pod_name
+            )
+            stage(directory, names, destinations, pod_name)
+
+    if copied:
+        print(f"copied {copied} module map files")
+    return copied
+
+
+def declared_module_name(modulemap: str) -> str | None:
+    """Return the module name declared by a module map, if there is one."""
+    import re
+
+    try:
+        with open(modulemap, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    match = re.search(
+        r'^\s*(?:framework\s+)?module\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\])?\s*\{',
+        text, re.MULTILINE,
+    )
+    return match.group(1) if match else None
+
+
+def _ensure_swift_headers(modulemap: str) -> None:
+    """Create the generated Swift headers a module map points at.
+
+    Swift Build writes a `.Swift` submodule into every module map for a target
+    with `DEFINES_MODULE`, pointing at `<products>/<Pod>/Swift Compatibility
+    Header/<Pod>-Swift.h`. Nothing in the CocoaPods project produces that file
+    before the module is built, so it has to exist up front. When the real
+    header is generated later it replaces this empty placeholder.
+    """
+    import re
+
+    try:
+        with open(modulemap, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return
+    for match in re.finditer(r'header\s+"([^"]+)"', text):
+        header = match.group(1)
+        if "Swift Compatibility Header" not in header or os.path.isfile(header):
+            continue
+        try:
+            os.makedirs(os.path.dirname(header), exist_ok=True)
+            with open(header, "w", encoding="utf-8") as handle:
+                handle.write("// generated at build time\n")
+        except OSError:
+            continue
+
+
+def stage(ios_dir: str, configuration: str, products: str, developer_dir: str = "") -> int:
+    pods = os.path.join(ios_dir, "Pods")
+    support = os.path.join(pods, "Target Support Files")
+    if not os.path.isdir(support):
+        return 0
+    xcframeworks_dir = os.path.join(products, f"{configuration}-iphoneos", "XCFrameworkIntermediates")
+    env = {
+        "PODS_ROOT": pods,
+        "PODS_XCFRAMEWORKS_BUILD_DIR": xcframeworks_dir,
+        "BUILD_DIR": products,
+        "CONFIGURATION": configuration,
+        "PLATFORM_NAME": "iphoneos",
+    }
+
+    staged = 0
+    for pod in sorted(os.listdir(support)):
+        directory = os.path.join(support, pod)
+        if not os.path.isdir(directory):
+            continue
+        inputs = read_list(os.path.join(directory, f"{pod}-xcframeworks-input-files.xcfilelist"))
+        outputs = read_list(os.path.join(directory, f"{pod}-xcframeworks-output-files.xcfilelist"))
+        frameworks = [expand(item, env) for item in inputs if expand(item, env).endswith(".xcframework")]
+        destinations = [expand(item, env) for item in outputs]
+        if not frameworks:
+            continue
+        for framework in frameworks:
+            ensure_prebuilt(framework, pods, developer_dir,
+                            os.path.join(ios_dir, "build", "prebuilt"))
+        destination = destinations[0] if destinations else os.path.join(
+            xcframeworks_dir, pod, f"{pod}.framework"
+        )
+        # A previously staged copy can be stale: an SPM-backed pod may have
+        # been staged as its `ar` stub before the real framework was built.
+        # Only trust a destination whose binary is Mach-O.
+        if os.path.isdir(destination):
+            name = os.path.basename(destination)
+            stem = name[: -len(".framework")] if name.endswith(".framework") else name
+            if is_macho(os.path.join(destination, stem)):
+                continue
+            shutil.rmtree(destination)
+        elif os.path.lexists(destination):
+            os.remove(destination)
+        source = None
+        for framework in frameworks:
+            for slice_name in SLICES:
+                candidate = os.path.join(framework, slice_name)
+                if os.path.isdir(candidate):
+                    source = candidate
+                    break
+            if source:
+                break
+        if not source:
+            print(f"warning: no device slice for {pod}", file=sys.stderr)
+            continue
+        # The output list names the framework itself; copy the slice's
+        # framework to exactly that path.
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        if destination.endswith(".framework"):
+            inner = [n for n in os.listdir(source) if n.endswith(".framework")]
+            source_entry = os.path.join(source, inner[0]) if inner else source
+            if os.path.isdir(destination):
+                shutil.rmtree(destination)
+            elif os.path.lexists(destination):
+                os.remove(destination)
+            if os.path.isdir(source_entry):
+                shutil.copytree(source_entry, destination, symlinks=True)
+            else:
+                shutil.copy2(source_entry, destination)
+        else:
+            os.makedirs(destination, exist_ok=True)
+            entries = os.listdir(source)
+            for entry in entries:
+                target = os.path.join(destination, entry)
+                if os.path.isdir(target):
+                    shutil.rmtree(target)
+                elif os.path.lexists(target):
+                    os.remove(target)
+                source_entry = os.path.join(source, entry)
+                if os.path.isdir(source_entry):
+                    shutil.copytree(source_entry, target, symlinks=True)
+                else:
+                    shutil.copy2(source_entry, target)
+        staged += 1
+    if staged:
+        print(f"staged {staged} xcframework slices")
+    return staged
+
+
+def ios_dir_from_pif(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as handle:
+        objects = json.load(handle)
+    for item in objects:
+        if item.get("type") != "project":
+            continue
+        project_path = item.get("contents", {}).get("path", "")
+        if project_path.endswith("project.pbxproj"):
+            return os.path.dirname(os.path.dirname(project_path))
+        if project_path.endswith(".xcodeproj"):
+            return os.path.dirname(project_path)
+        if project_path:
+            return os.path.dirname(project_path)
+    return ""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ios-dir")
+    parser.add_argument("--pif")
+    parser.add_argument("--parameters", required=True)
+    args = parser.parse_args()
+
+    with open(args.parameters, "r", encoding="utf-8") as handle:
+        parameters = json.load(handle)
+    arena = parameters.get("arenaInfo") or {}
+    products = arena.get("buildProductsPath")
+    if not products:
+        print("warning: no buildProductsPath; skipping xcframework staging", file=sys.stderr)
+        return 0
+    ios_dir = args.ios_dir or (ios_dir_from_pif(args.pif) if args.pif else "")
+    if not ios_dir:
+        print("warning: could not determine the project directory", file=sys.stderr)
+        return 0
+    configuration = parameters.get("configurationName") or "Release"
+    swift_headers: dict[str, str] = {}
+    target_dependencies: dict[str, list[str]] = {}
+    if args.pif and os.path.isfile(args.pif):
+        try:
+            with open(args.pif, "r", encoding="utf-8") as handle:
+                documents = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            documents = []
+
+        guid_to_name: dict[str, str] = {}
+        for document in documents:
+            if not isinstance(document, dict) or document.get("type") != "target":
+                continue
+            contents = document.get("contents") or {}
+            guid = contents.get("guid")
+            name = contents.get("name")
+            if guid and name:
+                guid_to_name[guid] = name
+
+        for document in documents:
+            if not isinstance(document, dict) or document.get("type") != "target":
+                continue
+            contents = document.get("contents") or {}
+            name = contents.get("name", "")
+            for build_configuration in contents.get("buildConfigurations", []):
+                if build_configuration.get("name") != configuration:
+                    continue
+                settings = build_configuration.get("buildSettings") or {}
+                header = settings.get("SWIFT_OBJC_INTERFACE_HEADER_NAME")
+                if header:
+                    swift_headers[name] = header
+            dependencies: list[str] = []
+            for dependency in contents.get("dependencies", []):
+                guid = dependency.get("guid") if isinstance(dependency, dict) else dependency
+                dependency_name = guid_to_name.get(guid)
+                if dependency_name:
+                    dependencies.append(dependency_name)
+            target_dependencies[name] = dependencies
+
+    stage(os.path.abspath(ios_dir), configuration, products,
+          os.environ.get("DEVELOPER_DIR", ""))
+    stage_modulemaps(
+        os.path.abspath(ios_dir), configuration, products,
+        swift_headers, target_dependencies,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

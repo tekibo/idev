@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""`ditto` for Linux — the copy CocoaPods script phases rely on.
+
+CocoaPods' generated phases copy the Swift compatibility header, the module
+map and the umbrella header with `ditto`, which macOS ships and Linux does not.
+Without it every "Copy generated compatibility header" phase fails, so the
+module map points at a header that was never written.
+
+This implements the calls those phases actually make: copy a file, or merge a
+directory tree.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+
+
+def copy(source: str, destination: str) -> None:
+    if os.path.isdir(source):
+        os.makedirs(destination, exist_ok=True)
+        for entry in os.listdir(source):
+            copy(os.path.join(source, entry), os.path.join(destination, entry))
+        return
+    parent = os.path.dirname(destination)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    shutil.copy2(source, destination)
+
+
+def main() -> int:
+    arguments = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if len(arguments) < 2:
+        print("usage: ditto <source> <destination>", file=sys.stderr)
+        return 2
+    source, destination = arguments[0], arguments[1]
+    try:
+        copy(source, destination)
+    except OSError as error:
+        print(f"ditto: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

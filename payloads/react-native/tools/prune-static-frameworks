@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Remove static frameworks that the embed phase copied into an app bundle.
+
+CocoaPods' `Pods-<target>-frameworks.sh` calls `install_framework` for every
+vendored xcframework, including pods whose podspec sets
+`static_framework = true`. A static framework is already linked into the app
+executable, so copying it into `Frameworks/` only ships a duplicate; worse, the
+copied file is an `ar` archive rather than a Mach-O image, and signers reject
+it (xtool: "Invalid mach-O file (magic: 0x72613c21)").
+
+Frameworks whose main binary is Mach-O are left untouched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+
+ARCHIVE_MAGIC = b"!<arch>\n"
+
+
+def log(message: str) -> None:
+    print(f"prune-static-frameworks: {message}", file=sys.stderr)
+
+
+def configuration_from(derived: str) -> tuple[str, str]:
+    """Read configuration and platform from Swift Build's parameters."""
+    parameters = os.path.join(derived, "build-parameters.json")
+    configuration, platform = "Release", "iphoneos"
+    try:
+        with open(parameters, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return configuration, platform
+    configuration = data.get("configurationName") or configuration
+    destination = data.get("activeRunDestination") or {}
+    platform = destination.get("platform") or platform
+    return configuration, platform
+
+
+def is_static_framework(framework: str) -> bool:
+    name = os.path.basename(framework)[: -len(".framework")]
+    binary = os.path.join(framework, name)
+    if not os.path.isfile(binary):
+        return False
+    try:
+        with open(binary, "rb") as handle:
+            return handle.read(len(ARCHIVE_MAGIC)) == ARCHIVE_MAGIC
+    except OSError:
+        return False
+
+
+def prune(app: str) -> int:
+    frameworks_dir = os.path.join(app, "Frameworks")
+    if not os.path.isdir(frameworks_dir):
+        return 0
+    removed = 0
+    for entry in sorted(os.listdir(frameworks_dir)):
+        if not entry.endswith(".framework"):
+            continue
+        path = os.path.join(frameworks_dir, entry)
+        if not is_static_framework(path):
+            continue
+        shutil.rmtree(path)
+        print(f"  removed static framework {entry}")
+        removed += 1
+    if removed:
+        log(f"removed {removed} static framework(s) from {os.path.basename(app)}")
+    return removed
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--derived", help="DerivedData directory containing build-parameters.json")
+    parser.add_argument("app", nargs="?", help="app bundle to prune")
+    arguments = parser.parse_args(argv)
+
+    if arguments.app:
+        prune(arguments.app)
+        return 0
+
+    if not arguments.derived:
+        parser.error("either an app bundle or --derived is required")
+
+    configuration, platform = configuration_from(arguments.derived)
+    products = os.path.join(arguments.derived, "Build", "Products", f"{configuration}-{platform}")
+    if not os.path.isdir(products):
+        return 0
+    for entry in sorted(os.listdir(products)):
+        if entry.endswith(".app"):
+            prune(os.path.join(products, entry))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

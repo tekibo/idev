@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# xcode-select shim for i-dev transparent macOS compatibility
+for arg in "$@"; do
+    case "$arg" in
+        -p|--print-path)
+            echo "/Applications/Xcode.app/Contents/Developer"
+            exit 0
+            ;;
+        -v|--version)
+            echo "xcode-select version 2409."
+            exit 0
+            ;;
+        -s|--switch|-r|--reset|--install)
+            exit 0
+            ;;
+    esac
+done
+echo "/Applications/Xcode.app/Contents/Developer"
+exit 0
